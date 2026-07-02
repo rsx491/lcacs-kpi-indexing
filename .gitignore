@@ -32,4 +32,4 @@ lcacs_kpi_30d_validation_summary.json
 kpi_index_exports/
 
 # Generated logs
-*.log
+*.log*_validation_summary.json
