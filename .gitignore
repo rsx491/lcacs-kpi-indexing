@@ -1,0 +1,35 @@
+# Generated validation artifacts
+*.csv
+*.tgz
+*.ndjson
+*.data.json
+*.mapping.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+
+# Python packaging
+.pytest_cache/
+.mypy_cache/
+
+# Local environment
+.env
+.env.*
+
+# Generated validation artifacts
+lcacs_kpi_30d_validation_summary.json
+
+# Generated exports
+kpi_index_exports/
+
+# Generated logs
+*.log
