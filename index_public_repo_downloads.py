@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 
+"""
+LCACS Public Repository Downloads KPI
+
+Canonical implementation.
+
+This script indexes public repository download events from LCACS web server
+logs and produces the OpenSearch index used by the Public Repository Downloads
+KPI dashboard.
+
+Designed to be executed directly or orchestrated by the KPI framework.
+Runtime parameters are supplied via command-line arguments.
+"""
+
+SCRIPT_NAME = "index_public_repo_downloads"
+SCRIPT_VERSION = "1.0.0"
+
 import argparse
 import gzip
 import hashlib
@@ -7,13 +23,13 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote
 
 import requests
 
 
 DEFAULT_ES_URL = "http://localhost:9200"
-DEFAULT_INDEX = "lcacs-kpi-public-repo-downloads-30d-v1"
+DEFAULT_INDEX = "lcacs-kpi-public-repo-downloads"
 
 TS_FORMAT = "%d/%b/%Y:%H:%M:%S %z"
 
@@ -61,6 +77,10 @@ PUBLIC_REPOS = {
 }
 
 
+# ============================================================================
+# Log Parsing Helpers
+# ============================================================================
+
 def open_log(path: Path):
     if path.suffix == ".gz":
         return gzip.open(path, "rt", errors="replace")
@@ -81,14 +101,12 @@ def normalize_endpoint(request: str) -> str:
     """
     request = request.strip()
 
-    # If the log captured an absolute URL, strip scheme/host defensively.
     if request.startswith("http://") or request.startswith("https://"):
         marker = "://"
         after_scheme = request.split(marker, 1)[1]
         slash_pos = after_scheme.find("/")
         request = "/" + after_scheme[slash_pos + 1:] if slash_pos >= 0 else "/"
 
-    # Remove query string and fragment manually.
     request = request.split("?", 1)[0]
     request = request.split("#", 1)[0]
 
@@ -157,6 +175,10 @@ def parse_download_endpoint(endpoint: str):
     return None
 
 
+# ============================================================================
+# Index Management
+# ============================================================================
+
 def create_index(es_url: str, index: str, recreate: bool = False):
     mapping = {
         "mappings": {
@@ -200,6 +222,13 @@ def create_index(es_url: str, index: str, recreate: bool = False):
 
                 "source": {"type": "keyword"},
                 "kpi_name": {"type": "keyword"},
+                "script_name": {"type": "keyword"},
+                "script_version": {"type": "keyword"},
+
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -218,6 +247,10 @@ def create_index(es_url: str, index: str, recreate: bool = False):
 
     print(f"Created index: {index}")
 
+
+# ============================================================================
+# Output
+# ============================================================================
 
 def bulk_index(es_url: str, index: str, docs: list):
     if not docs:
@@ -251,7 +284,20 @@ def bulk_index(es_url: str, index: str, docs: list):
         raise RuntimeError(f"Bulk had errors: {json.dumps(result)[:3000]}")
 
 
-def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 5000):
+# ============================================================================
+# KPI Construction
+# ============================================================================
+
+def parse_log_file(
+    log_file: Path,
+    es_url: str,
+    index: str,
+    batch_size: int = 5000,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+    dry_run: bool = False,
+):
     total_lines = 0
     download_lines_seen = 0
 
@@ -268,6 +314,7 @@ def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 50
     repo_counts = {}
 
     batch = []
+    generated_at = datetime.now(timezone.utc).isoformat()
 
     with open_log(log_file) as f:
         for line in f:
@@ -331,8 +378,15 @@ def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 50
                 "is_public_repo": True,
                 "is_repo_identifiable": True,
 
-                "source": "lcacs_web_logs_30d",
+                "source": "lcacs_web_logs",
                 "kpi_name": "public_repo_download_counts",
+                "script_name": SCRIPT_NAME,
+                "script_version": SCRIPT_VERSION,
+
+                "run_label": run_label,
+                "kpi_period_start": start_date,
+                "kpi_period_end": end_date,
+                "generated_at": generated_at,
             }
 
             indexed_public_events += 1
@@ -351,13 +405,20 @@ def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 50
             batch.append(doc)
 
             if len(batch) >= batch_size:
-                bulk_index(es_url, index, batch)
+                if not dry_run:
+                    bulk_index(es_url, index, batch)
                 batch.clear()
 
     if batch:
-        bulk_index(es_url, index, batch)
+        if not dry_run:
+            bulk_index(es_url, index, batch)
 
     print("\n=== PUBLIC REPO DOWNLOAD INDEXING SUMMARY ===")
+    print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+    print(f"Run label: {run_label}")
+    print(f"KPI period: {start_date} to {end_date}")
+    print(f"Dry run: {dry_run}")
+
     print(f"Total raw log lines read: {total_lines:,}")
     print(f"Download/json lines seen: {download_lines_seen:,}")
     print(f"Indexed public repo download events: {indexed_public_events:,}")
@@ -379,14 +440,22 @@ def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 50
         print(f"  {count:,}\t{repo_path}")
 
 
+# ============================================================================
+# Entry Point
+# ============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Index 30-day LCACS public repository download counts."
+        description="Index LCACS public repository download counts."
     )
-    parser.add_argument("log_file", help="Path to logs_30d_all.log or logs_30d_all.log.gz")
+    parser.add_argument("log_file", help="Path to a combined LCACS access log file, plain text or .gz")
     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
     parser.add_argument("--index", default=DEFAULT_INDEX)
+    parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+    parser.add_argument("--run-label", default="manual")
     parser.add_argument("--recreate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     log_file = Path(args.log_file)
@@ -394,7 +463,15 @@ def main():
         raise SystemExit(f"File not found: {log_file}")
 
     create_index(args.es_url, args.index, recreate=args.recreate)
-    parse_log_file(log_file, args.es_url, args.index)
+    parse_log_file(
+        log_file,
+        args.es_url,
+        args.index,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":
