@@ -185,6 +185,11 @@ def create_index(es_url: str, index: str, recreate: bool = False):
                 "kpi_name": {"type": "keyword"},
                 "script_name": {"type": "keyword"},
                 "script_version": {"type": "keyword"},
+
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -245,7 +250,16 @@ def bulk_index(es_url: str, index: str, docs: list):
 # KPI Construction
 # ============================================================================
 
-def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 5000):
+def parse_log_file(
+    log_file: Path,
+    es_url: str,
+    index: str,
+    batch_size: int = 5000,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+    dry_run: bool = False,
+):
     total_lines = 0
     public_api_calls = 0
 
@@ -261,6 +275,7 @@ def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 50
     status_counts = {}
 
     batch = []
+    generated_at = datetime.now(timezone.utc).isoformat()
 
     with open_log(log_file) as f:
         for line in f:
@@ -346,19 +361,29 @@ def parse_log_file(log_file: Path, es_url: str, index: str, batch_size: int = 50
                 "kpi_name": "api_calls_token_vs_non_token",
                 "script_name": SCRIPT_NAME,
                 "script_version": SCRIPT_VERSION,
+
+                "run_label": run_label,
+                "kpi_period_start": start_date,
+                "kpi_period_end": end_date,
+                "generated_at": generated_at,
             }
 
             batch.append(doc)
 
             if len(batch) >= batch_size:
-                bulk_index(es_url, index, batch)
+                if not dry_run:
+                    bulk_index(es_url, index, batch)
                 batch.clear()
 
     if batch:
-        bulk_index(es_url, index, batch)
+        if not dry_run:
+            bulk_index(es_url, index, batch)
 
     print("\n=== API CALL INDEXING SUMMARY ===")
     print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+    print(f"Run label: {run_label}")
+    print(f"KPI period: {start_date} to {end_date}")
+    print(f"Dry run: {dry_run}")
     print(f"Total raw log lines read: {total_lines:,}")
     print(f"Public /ws/public calls indexed: {public_api_calls:,}")
 
@@ -391,7 +416,11 @@ def main():
     parser.add_argument("log_file", help="Path to a combined LCACS access log file, plain text or .gz")
     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
     parser.add_argument("--index", default=DEFAULT_INDEX)
+    parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+    parser.add_argument("--run-label", default="manual")
     parser.add_argument("--recreate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     log_file = Path(args.log_file)
@@ -399,7 +428,15 @@ def main():
         raise SystemExit(f"File not found: {log_file}")
 
     create_index(args.es_url, args.index, recreate=args.recreate)
-    parse_log_file(log_file, args.es_url, args.index)
+    parse_log_file(
+        log_file,
+        args.es_url,
+        args.index,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":
