@@ -281,17 +281,12 @@ def build_docs(public_repos: list, old_unit_counts: Dict[str, Dict[str, Any]], o
                         "as total. LCI_RESULT/System Process count set to 0."
                     )
             else:
-                # We have a repo-level PROCESS total, but no validated UNIT_PROCESS split.
-                # For the Unit Process KPI, treat the public PROCESS total as unit processes
-                # unless/until an LCI_RESULT/System split is available.
                 total_count = browse_total
-                unit_count = browse_total
                 lci_count = 0
-                status = "inferred_unit_process_count_from_public_process_total"
+                status = "total_only_unit_missing"
                 note = (
                     "Total PROCESS count pulled from repo-scoped browse endpoint, but no validated "
-                    "UNIT_PROCESS/LCI_RESULT split was available. For the unit-process KPI, the public "
-                    "PROCESS total is counted as UNIT_PROCESS unless a System Process split is later validated."
+                    "UNIT_PROCESS count was available. Total process count is usable; split cannot be derived."
                 )
         else:
             total_count = unit_count
