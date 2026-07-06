@@ -8,6 +8,8 @@ from typing import Dict, Any, Optional
 
 import requests
 
+SCRIPT_NAME = "index_public_process_inventory"
+SCRIPT_VERSION = "1.0.0"
 
 DEFAULT_ES_URL = "http://localhost:9200"
 DEFAULT_OLD_UNIT_INDEX = "lcacs-kpi-estimated-unit-process-downloads-poc"
@@ -62,6 +64,14 @@ def create_target_index(es_url: str, index: str, recreate: bool = False):
                 "source": {"type": "keyword"},
                 "kpi_name": {"type": "keyword"},
                 "kpi_definition": {"type": "text"},
+
+                # Framework metadata
+                "script_name": {"type": "keyword"},
+                "script_version": {"type": "keyword"},
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -246,7 +256,14 @@ def bulk_index(es_url: str, index: str, docs: list):
         raise RuntimeError(f"Bulk had errors: {json.dumps(result)[:3000]}")
 
 
-def build_docs(public_repos: list, old_unit_counts: Dict[str, Dict[str, Any]], old_unit_index: str):
+def build_docs(
+    public_repos: list,
+    old_unit_counts: Dict[str, Dict[str, Any]],
+    old_unit_index: str,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+):    
     now = datetime.now(timezone.utc).isoformat()
     docs = []
     warnings = []
@@ -339,7 +356,15 @@ def build_docs(public_repos: list, old_unit_counts: Dict[str, Dict[str, Any]], o
                 "Current public process inventory by repository. Total PROCESS count is pulled from "
                 "the LCACS public browse endpoint. UNIT_PROCESS count uses validated historical counts "
                 "where available. LCI_RESULT/System Process is derived as total PROCESS minus UNIT_PROCESS."
-            )
+            ),
+
+            # Framework metadata
+            "script_name": SCRIPT_NAME,
+            "script_version": SCRIPT_VERSION,
+            "run_label": run_label,
+            "kpi_period_start": start_date,
+            "kpi_period_end": end_date,
+            "generated_at": now,
         }
 
         if status != "available":
@@ -350,7 +375,14 @@ def build_docs(public_repos: list, old_unit_counts: Dict[str, Dict[str, Any]], o
     return docs, warnings
 
 
-def print_summary(docs: list, warnings: list):
+def print_summary(
+    docs: list,
+    warnings: list,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+    dry_run: bool = False,
+):
     repo_count = len(docs)
     unit_total = sum(d["current_unit_process_count"] for d in docs)
     lci_total = sum(d["current_lci_result_count"] for d in docs)
@@ -360,6 +392,11 @@ def print_summary(docs: list, warnings: list):
     needs_review = repo_count - available
 
     print("\n=== PUBLIC PROCESS INVENTORY SUMMARY ===")
+    print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+    print(f"Run label: {run_label}")
+    print(f"KPI period: {start_date} to {end_date}")
+    print(f"Dry run: {dry_run}")
+
     print(f"Public repositories indexed: {repo_count:,}")
     print(f"Repositories with derived Unit/System split: {available:,}")
     print(f"Repositories needing review or fallback: {needs_review:,}")
@@ -391,7 +428,11 @@ def main():
     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
     parser.add_argument("--old-unit-index", default=DEFAULT_OLD_UNIT_INDEX)
     parser.add_argument("--index", default=DEFAULT_TARGET_INDEX)
+    parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+    parser.add_argument("--run-label", default="manual")
     parser.add_argument("--recreate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
 
@@ -405,11 +446,28 @@ def main():
     old_unit_counts = get_old_validated_unit_counts(args.es_url, args.old_unit_index)
     print(f"Found validated UNIT_PROCESS counts for {len(old_unit_counts):,} repos.")
 
-    docs, warnings = build_docs(public_repos, old_unit_counts, args.old_unit_index)
+    docs, warnings = build_docs(
+        public_repos,
+        old_unit_counts,
+        args.old_unit_index,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+    )
 
-    bulk_index(args.es_url, args.index, docs)
-    print_summary(docs, warnings)
+    if not args.dry_run:
+        bulk_index(args.es_url, args.index, docs)
+    else:
+        print("Dry run enabled; skipping bulk index.")
 
+    print_summary(
+        docs,
+        warnings,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+        dry_run=args.dry_run,
+    )
 
 if __name__ == "__main__":
     main()
