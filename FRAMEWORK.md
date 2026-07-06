@@ -1,105 +1,206 @@
 # LCACS KPI Indexing Framework Contract
 
-1. Purpose
-What the framework does: generate LCACS KPI OpenSearch indexes for a requested date range.
+## 1. Purpose
 
-2. Execution model
-MacBook/dev first, local validation, then export/import to Stage.
+Generate LCACS KPI OpenSearch indexes for a requested reporting period using exported LCACS web server logs.
 
-3. Standard CLI arguments
-Every KPI should eventually support:
-  --start-date YYYY-MM-DD
-  --end-date YYYY-MM-DD
-  --log-dir PATH
-  --log-file PATH
-  --es-url URL
-  --index INDEX_NAME
-  --run-label LABEL
-  --recreate
-  --dry-run
+---
 
-4. Required document metadata
+## 2. Execution Model
+
+The framework begins after production log collection.
+
+Typical workflow:
+
+1. Run the production log export command for the requested reporting period.
+2. Download the exported logs to the MacBook development environment.
+3. Execute KPI indexing locally.
+4. Validate KPI indexes locally.
+5. Export validated OpenSearch indexes.
+6. Import validated artifacts into Stage.
+
+The framework does **not** collect production logs directly.
+
+---
+
+## 3. Standard CLI Arguments
+
+Every KPI script should eventually support:
+
+```text
+--start-date YYYY-MM-DD
+--end-date YYYY-MM-DD
+--log-dir PATH
+--log-file PATH
+--es-url URL
+--index INDEX_NAME
+--run-label LABEL
+--recreate
+--dry-run
+```
+
+---
+
+## 4. Required Document Metadata
+
 Every indexed document should include:
-  kpi_name
-  script_name
-  script_version
-  run_label
-  kpi_period_start
-  kpi_period_end
-  generated_at
-  source
 
-5. Index naming convention
+```text
+kpi_name
+script_name
+script_version
+run_label
+kpi_period_start
+kpi_period_end
+generated_at
+source
+```
+
+---
+
+## 5. Index Naming Convention
+
+Examples:
+
+```text
+lcacs-kpi-api-calls-annual-2025-v1
+
+lcacs-kpi-public-repo-downloads-2025-01-01-to-2025-12-31-v1
+```
+
+---
+
+## 6. Reporting Period Semantics
+
+The reporting period is defined by the exported production log set.
+
+Framework parameters:
+
+```text
+--start-date
+--end-date
+```
+
+represent the reporting period metadata and validation boundaries.
+
+Recommended convention:
+
+- `start-date` is **inclusive**
+- `end-date` is **exclusive**
+
 Example:
-  lcacs-kpi-api-calls-annual-2025-v1
-  lcacs-kpi-public-repo-downloads-2025-01-01-to-2025-12-31-v1
 
-6. Date-range semantics
-Define whether:
-  start-date is inclusive
-  end-date is exclusive or inclusive
+```text
+--start-date 2025-01-01
+--end-date   2026-01-01
+```
 
-I strongly recommend:
-  start-date inclusive
-  end-date exclusive
+The framework assumes the supplied logs correspond to the requested reporting period.
 
-Example:
-  --start-date 2025-01-01
-  --end-date 2026-01-01
+---
 
-7. Input expectations
-Define accepted inputs:
-  combined plain log
-  combined .gz log
-  directory of lca_access.log*
-  downloaded /app/weblogs files
+## 7. Input Expectations
 
-8. Output expectations
+Accepted inputs include:
+
+- Combined plain-text log
+- Combined compressed (`.gz`) log
+- Directory containing `lca_access.log*`
+- Downloaded `/app/weblogs` files
+- Production-exported reporting-period log bundle
+
+The production log export process is outside the scope of this framework.
+
+---
+
+## 8. Output Expectations
+
 Each KPI produces:
-  OpenSearch index
-  summary printed to stdout
-  optional validation JSON
-  optional export artifacts
 
-9. Validation requirements
+- OpenSearch index
+- Summary printed to stdout
+- Optional validation JSON
+- Optional export artifacts
+
+---
+
+## 9. Validation Requirements
+
 Before export, validate:
-  index exists
-  document count > 0
-  required fields exist
-  date range matches expected period
-  dashboard-critical fields are populated
 
-10. Dependency order
+- Index exists
+- Document count > 0
+- Required fields exist
+- Reporting period metadata matches the requested period
+- Dashboard-critical fields are populated
+
+---
+
+## 10. Dependency Order
+
 Some KPIs depend on others.
 
 Example:
-  public_repo_downloads must run before estimated_process_downloads
 
-11. Failure behavior
-Define:
-  fail fast on missing required input
-  fail fast on OpenSearch errors
-  allow warnings for missing repo metadata
-  do not silently skip large parsing failures
+```text
+public_repo_downloads
+        ↓
+estimated_process_downloads
+```
 
-12. Security/data handling
-Define:
-  API keys must be redacted
-  raw logs are not committed
-  generated exports are not committed
-  no secrets in Git
+Dependencies should be documented by each KPI.
 
-13. Export/import model
-Dev validates locally.
-Only validated artifacts are exported for Stage.
+---
 
-14. Versioning
-Every script has:
-  SCRIPT_NAME
-  SCRIPT_VERSION
+## 11. Failure Behavior
 
-Framework version can be separate later.
+The framework should:
 
-15. Backward compatibility
-Archived scripts are historical only.
-Canonical scripts are the framework targets.
+- Fail fast on missing required input
+- Fail fast on OpenSearch errors
+- Allow warnings for missing repository metadata
+- Never silently skip parsing failures
+- Clearly report document counts and skipped records
+
+---
+
+## 12. Security / Data Handling
+
+Requirements:
+
+- API keys must be redacted
+- Raw logs are never committed
+- Generated OpenSearch exports are never committed
+- Validation artifacts are not committed unless intentionally versioned
+- Secrets and credentials are never committed
+
+---
+
+## 13. Export / Import Model
+
+Validation always occurs locally.
+
+Only validated indexes are exported for Stage import.
+
+The framework assumes production log export has already completed before KPI generation begins.
+
+---
+
+## 14. Versioning
+
+Every canonical KPI script includes:
+
+```text
+SCRIPT_NAME
+SCRIPT_VERSION
+```
+
+The framework itself may introduce its own version identifier in the future.
+
+---
+
+## 15. Backward Compatibility
+
+Archived scripts are retained for historical reference only.
+
+Canonical scripts represent the supported implementations that conform to this framework contract.
