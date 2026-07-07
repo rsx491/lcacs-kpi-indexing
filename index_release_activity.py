@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+SCRIPT_NAME = "index_release_activity"
+SCRIPT_VERSION = "1.0.0"
+
+DEFAULT_ES_URL = "http://localhost:9200"
+DEFAULT_SUMMARY_INDEX = "lcacs-kpi-release-activity"
+DEFAULT_EVENTS_INDEX = "lcacs-kpi-release-activity-events"
+DEFAULT_DOC_ID = "release-activity-current"
+
 import argparse
 import gzip
 import json
@@ -7,7 +15,6 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 
@@ -105,7 +112,12 @@ def classify_release_activity(method: str, status: int):
     return "release_endpoint_other_200"
 
 
-def parse_log(log_path: Path):
+def parse_log(
+    log_path: Path,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+):
     counts = Counter()
     by_repo = defaultdict(Counter)
     events = []
@@ -115,6 +127,8 @@ def parse_log(log_path: Path):
 
     first_ts = None
     last_ts = None
+
+    generated_at = datetime.now(timezone.utc).isoformat()
 
     with open_log(log_path) as f:
         for line in f:
@@ -165,6 +179,14 @@ def parse_log(log_path: Path):
                 "repository": repo,
                 "commit_id": commit_id,
                 "activity_type": activity_type,
+
+                # Framework metadata
+                "script_name": SCRIPT_NAME,
+                "script_version": SCRIPT_VERSION,
+                "run_label": run_label,
+                "kpi_period_start": start_date,
+                "kpi_period_end": end_date,
+                "generated_at": generated_at,
             })
 
     print(f"DEBUG release_endpoint_lines={release_endpoint_lines}, events={len(events)}")
@@ -212,6 +234,14 @@ def create_summary_index(es_url: str, index_name: str):
                 "metric_group": {"type": "keyword"},
                 "metric_note": {"type": "text"},
                 "calculation": {"type": "keyword"},
+
+                # Framework metadata
+                "script_name": {"type": "keyword"},
+                "script_version": {"type": "keyword"},
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -240,6 +270,14 @@ def create_events_index(es_url: str, index_name: str):
                 "repository": {"type": "keyword"},
                 "commit_id": {"type": "keyword"},
                 "activity_type": {"type": "keyword"},
+
+                # Framework metadata
+                "script_name": {"type": "keyword"},
+                "script_version": {"type": "keyword"},
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -294,11 +332,15 @@ def main():
         description="Parse LCACS release endpoint activity from web logs and index KPI fields into OpenSearch."
     )
 
-    parser.add_argument("log_file", help="Path to logs_30d_all.log or logs_30d_all.log.gz")
-    parser.add_argument("--es-url", default="http://localhost:9200")
-    parser.add_argument("--summary-index", default="lcacs-kpi-release-activity-30d")
-    parser.add_argument("--events-index", default="lcacs-kpi-release-activity-events-30d")
-    parser.add_argument("--doc-id", default="release-activity-30d-current")
+    parser.add_argument("log_file", help="Path to a combined LCACS access log file, plain text or .gz")
+    parser.add_argument("--es-url", default=DEFAULT_ES_URL)
+    parser.add_argument("--summary-index", default=DEFAULT_SUMMARY_INDEX)
+    parser.add_argument("--events-index", default=DEFAULT_EVENTS_INDEX)
+    parser.add_argument("--doc-id", default=DEFAULT_DOC_ID)
+    parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+    parser.add_argument("--run-label", default="manual")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-events", action="store_true", help="Only index the summary document, not individual events.")
 
     args = parser.parse_args()
@@ -308,11 +350,17 @@ def main():
     if not log_path.exists():
         raise SystemExit(f"File not found: {log_path}")
 
-    parsed = parse_log(log_path)
+    parsed = parse_log(
+        log_path,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+    )
     counts = parsed["counts"]
+    generated_at = datetime.now(timezone.utc).isoformat()
 
     summary_doc = {
-        "@timestamp": datetime.now(timezone.utc).isoformat(),
+        "@timestamp": generated_at,
         "window_start": parsed["first_timestamp"],
         "window_end": parsed["last_timestamp"],
         "source_log_file": str(log_path),
@@ -336,9 +384,21 @@ def main():
             "Corrected release KPI logic. git-receive-pack measures repository push/update activity, "
             "but actual release/publish activity is captured by the application release endpoint."
         ),
+
+        # Framework metadata
+        "script_name": SCRIPT_NAME,
+        "script_version": SCRIPT_VERSION,
+        "run_label": args.run_label,
+        "kpi_period_start": args.start_date,
+        "kpi_period_end": args.end_date,
+        "generated_at": generated_at,
     }
 
     print("\n=== RELEASE KPI SUMMARY ===")
+    print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+    print(f"Run label: {args.run_label}")
+    print(f"KPI period: {args.start_date} to {args.end_date}")
+    print(f"Dry run: {args.dry_run}")
     print(f"Window: {summary_doc['window_start']} to {summary_doc['window_end']}")
     print(f"Total log lines: {summary_doc['total_lines']:,}")
     print(f"Release endpoint lines: {summary_doc['release_endpoint_lines']:,}")
@@ -347,12 +407,15 @@ def main():
     print(f"Release info views: {summary_doc['release_info_views']}")
     print(f"Release endpoint non-200: {summary_doc['release_endpoint_non_200']}")
 
-    create_summary_index(args.es_url, args.summary_index)
-    index_summary(args.es_url, args.summary_index, summary_doc, args.doc_id)
+    if not args.dry_run:
+        create_summary_index(args.es_url, args.summary_index)
+        index_summary(args.es_url, args.summary_index, summary_doc, args.doc_id)
 
-    if not args.skip_events:
-        create_events_index(args.es_url, args.events_index)
-        bulk_index_events(args.es_url, args.events_index, parsed["events"])
+        if not args.skip_events:
+            create_events_index(args.es_url, args.events_index)
+            bulk_index_events(args.es_url, args.events_index, parsed["events"])
+    else:
+        print("Dry run enabled; skipping index creation and indexing.")
 
     print("\nDone.")
 
