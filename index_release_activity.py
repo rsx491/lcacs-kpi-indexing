@@ -334,14 +334,27 @@ def main():
 
     parser.add_argument("log_file", help="Path to a combined LCACS access log file, plain text or .gz")
     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
-    parser.add_argument("--summary-index", default=DEFAULT_SUMMARY_INDEX)
+
+    parser.add_argument(
+        "--summary-index",
+        "--index",
+        dest="summary_index",
+        default=DEFAULT_SUMMARY_INDEX,
+    )
+
     parser.add_argument("--events-index", default=DEFAULT_EVENTS_INDEX)
     parser.add_argument("--doc-id", default=DEFAULT_DOC_ID)
     parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
     parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
     parser.add_argument("--run-label", default="manual")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--skip-events", action="store_true", help="Only index the summary document, not individual events.")
+    parser.add_argument("--recreate", action="store_true")
+    
+    parser.add_argument(
+        "--skip-events",
+    action="store_true",
+    help="Only index the summary document, not individual events.",
+    )
 
     args = parser.parse_args()
 

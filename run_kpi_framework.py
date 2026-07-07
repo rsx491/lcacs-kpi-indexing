@@ -35,7 +35,7 @@ KPI_SCRIPTS = [
         "name": "total_repositories_published",
         "script": "index_total_repositories_published.py",
         "index_suffix": "total-repositories-published",
-        "requires_log_file": False,
+        "requires_log_file": True,
     },
     {
         "name": "estimated_process_downloads",
@@ -47,7 +47,7 @@ KPI_SCRIPTS = [
         "name": "release_activity",
         "script": "index_release_activity.py",
         "index_suffix": "release-activity",
-        "requires_log_file": False,
+        "requires_log_file": True,
     },
 ]
 
@@ -158,6 +158,18 @@ def main():
             "--end-date", end_date,
             "--run-label", run_label,
         ])
+
+        if kpi["name"] == "release_activity":
+            events_index_name = build_index_name(
+                args.index_prefix,
+                "release-activity-events",
+                run_label,
+                args.index_version,
+            )
+            cmd.extend([
+                "--events-index",
+                events_index_name,
+            ])
 
         if args.recreate:
             cmd.append("--recreate")
