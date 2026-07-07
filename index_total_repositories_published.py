@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 
+"""
+LCACS Total Repositories Published KPI
+
+Canonical implementation.
+
+This script uses git-receive-pack activity from LCACS web server logs as a
+repository publication proxy and produces the OpenSearch index used by the
+Total Repositories Published KPI dashboard.
+
+Designed to be executed directly or orchestrated by the KPI framework.
+Runtime parameters are supplied via command-line arguments.
+"""
+
+SCRIPT_NAME = "index_total_repositories_published"
+SCRIPT_VERSION = "1.0.0"
+
 import argparse
 import gzip
 import hashlib
@@ -13,7 +29,7 @@ import requests
 
 
 DEFAULT_ES_URL = "http://localhost:9200"
-DEFAULT_INDEX = "lcacs-kpi-repository-publication-proxy-30d-v1"
+DEFAULT_INDEX = "lcacs-kpi-total-repositories-published"
 
 TS_FORMAT = "%d/%b/%Y:%H:%M:%S %z"
 
@@ -136,6 +152,14 @@ def create_index(es_url: str, index: str, recreate: bool = False):
                 "source": {"type": "keyword"},
                 "kpi_name": {"type": "keyword"},
                 "kpi_definition": {"type": "text"},
+
+                # Framework metadata
+                "script_name": {"type": "keyword"},
+                "script_version": {"type": "keyword"},
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -183,12 +207,21 @@ def bulk_index(es_url: str, index: str, docs: list):
         raise RuntimeError(f"Bulk had errors: {json.dumps(result)[:3000]}")
 
 
-def parse_log_file(log_file: Path, es_url: str, index: str):
+def parse_log_file(
+    log_file: Path,
+    es_url: str,
+    index: str,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+    dry_run: bool = False,
+):
     total_lines = 0
     matching_push_rows = 0
     successful_push_rows = 0
 
     by_repo = {}
+    generated_at = datetime.now(timezone.utc).isoformat()
 
     with open_log(log_file) as f:
         for line in f:
@@ -249,12 +282,20 @@ def parse_log_file(log_file: Path, es_url: str, index: str):
                     "first_user": row["user"],
                     "first_user_agent": row["user_agent"],
 
-                    "source": "lcacs_web_logs_30d",
-                    "kpi_name": "repository_publication_proxy",
+                    "source": "lcacs_web_logs",
+                    "kpi_name": "total_repositories_published",
                     "kpi_definition": (
                         "First observed successful POST git-receive-pack event "
                         "with HTTP 200 for a repository in retained web logs."
                     ),
+
+                    # Framework metadata
+                    "script_name": SCRIPT_NAME,
+                    "script_version": SCRIPT_VERSION,
+                    "run_label": run_label,
+                    "kpi_period_start": start_date,
+                    "kpi_period_end": end_date,
+                    "generated_at": generated_at,
                 }
             else:
                 existing = by_repo[repo_path]
@@ -276,9 +317,18 @@ def parse_log_file(log_file: Path, es_url: str, index: str):
                     existing["last_observed_publish_timestamp"] = ts
 
     docs = list(by_repo.values())
-    bulk_index(es_url, index, docs)
 
-    print("\n=== REPOSITORY PUBLICATION PROXY INDEXING SUMMARY ===")
+    if not dry_run:
+        bulk_index(es_url, index, docs)
+    else:
+        print("Dry run enabled; skipping bulk index.")
+
+    print("\n=== TOTAL REPOSITORIES PUBLISHED SUMMARY ===")
+    print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+    print(f"Run label: {run_label}")
+    print(f"KPI period: {start_date} to {end_date}")
+    print(f"Dry run: {dry_run}")
+
     print(f"Total raw log lines read: {total_lines:,}")
     print(f"git-receive-pack rows seen: {matching_push_rows:,}")
     print(f"Successful POST git-receive-pack 200 rows: {successful_push_rows:,}")
@@ -298,10 +348,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Index first observed successful git-receive-pack POST 200 events by repository."
     )
-    parser.add_argument("log_file", help="Path to logs_30d_all.log or .gz")
+    parser.add_argument("log_file", help="Path to a combined LCACS access log file, plain text or .gz")
     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
     parser.add_argument("--index", default=DEFAULT_INDEX)
+    parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+    parser.add_argument("--run-label", default="manual")
     parser.add_argument("--recreate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
 
@@ -310,8 +364,16 @@ def main():
         raise SystemExit(f"File not found: {log_file}")
 
     create_index(args.es_url, args.index, recreate=args.recreate)
-    parse_log_file(log_file, args.es_url, args.index)
 
+    parse_log_file(
+        log_file,
+        args.es_url,
+        args.index,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+        dry_run=args.dry_run,
+    )
 
 if __name__ == "__main__":
     main()
