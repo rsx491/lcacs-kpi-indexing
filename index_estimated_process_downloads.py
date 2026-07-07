@@ -447,7 +447,14 @@ def main():
     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
     parser.add_argument("--download-index", default=DEFAULT_DOWNLOAD_INDEX)
     parser.add_argument("--old-unit-index", default=DEFAULT_OLD_UNIT_INDEX)
-    parser.add_argument("--target-index", default=DEFAULT_TARGET_INDEX)
+
+    parser.add_argument(
+        "--target-index",
+        "--index",
+        dest="target_index",
+        default=DEFAULT_TARGET_INDEX,
+    )
+
     parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
     parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
     parser.add_argument("--run-label", default="manual")
