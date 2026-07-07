@@ -88,7 +88,14 @@ def create_target_index(es_url: str, index: str, recreate: bool = False):
 
                 "download_count_source": {"type": "keyword"},
                 "source": {"type": "keyword"},
-                "kpi_name": {"type": "keyword"}
+                "kpi_name": {"type": "keyword"},
+
+                "script_name": {"type": "keyword"},
+                "script_version": {"type": "keyword"},
+                "run_label": {"type": "keyword"},
+                "kpi_period_start": {"type": "date"},
+                "kpi_period_end": {"type": "date"},
+                "generated_at": {"type": "date"},
             }
         }
     }
@@ -229,7 +236,15 @@ def get_total_process_count_from_browse(repo_path: str) -> Dict[str, Any]:
 # KPI Construction
 # ============================================================================
 
-def build_docs(download_counts: Dict[str, int], old_unit_counts: Dict[str, Dict[str, Any]], download_index: str, old_unit_index: str):
+def build_docs(
+    download_counts: Dict[str, int],
+    old_unit_counts: Dict[str, Dict[str, Any]],
+    download_index: str,
+    old_unit_index: str,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+):
     docs = []
     warnings = []
     now = datetime.now(timezone.utc).isoformat()
@@ -314,7 +329,11 @@ def build_docs(download_counts: Dict[str, int], old_unit_counts: Dict[str, Dict[
             "kpi_name": "estimated_process_downloads",
 
             "script_name": SCRIPT_NAME,
-            "script_version": SCRIPT_VERSION
+            "script_version": SCRIPT_VERSION,
+            "run_label": run_label,
+            "kpi_period_start": start_date,
+            "kpi_period_end": end_date,
+            "generated_at": now,
         }
 
         if status != "available":
@@ -358,7 +377,14 @@ def bulk_index(es_url: str, index: str, docs: list):
         raise RuntimeError(f"Bulk had errors: {json.dumps(result)[:3000]}")
 
 
-def print_summary(docs: list, warnings: list):
+def print_summary(
+    docs: list,
+    warnings: list,
+    start_date: str = None,
+    end_date: str = None,
+    run_label: str = "manual",
+    dry_run: bool = False,
+):
     total_downloads = sum(d["completed_public_repo_downloads"] for d in docs)
 
     total_unit = sum(d["current_unit_process_count"] for d in docs)
@@ -374,6 +400,9 @@ def print_summary(docs: list, warnings: list):
 
     print("\n=== ESTIMATED PROCESS DOWNLOADS SUMMARY ===")
     print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+    print(f"Run label: {run_label}")
+    print(f"KPI period: {start_date} to {end_date}")
+    print(f"Dry run: {dry_run}")
     print(f"Repositories indexed: {len(docs):,}")
     print(f"Repositories with full derived process counts: {available:,}")
     print(f"Repositories needing review/fallback: {not_available:,}")
@@ -419,7 +448,11 @@ def main():
     parser.add_argument("--download-index", default=DEFAULT_DOWNLOAD_INDEX)
     parser.add_argument("--old-unit-index", default=DEFAULT_OLD_UNIT_INDEX)
     parser.add_argument("--target-index", default=DEFAULT_TARGET_INDEX)
+    parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+    parser.add_argument("--run-label", default="manual")
     parser.add_argument("--recreate", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
 
@@ -437,11 +470,25 @@ def main():
         download_counts=download_counts,
         old_unit_counts=old_unit_counts,
         download_index=args.download_index,
-        old_unit_index=args.old_unit_index
+        old_unit_index=args.old_unit_index,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
     )
 
-    bulk_index(args.es_url, args.target_index, docs)
-    print_summary(docs, warnings)
+    if not args.dry_run:
+        bulk_index(args.es_url, args.target_index, docs)
+    else:
+        print("Dry run enabled; skipping bulk index.")
+
+    print_summary(
+        docs,
+        warnings,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        run_label=args.run_label,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":
