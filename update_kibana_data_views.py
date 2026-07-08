@@ -13,6 +13,8 @@ DEFAULT_INDEX_PREFIX = "lcacs-kpi"
 DEFAULT_INDEX_VERSION = "v1"
 
 
+# Multiple dashboards reference different historical data view IDs.
+# Update all of them to point to the current annual index.
 DATA_VIEWS = [
     {
         "label": "API Calls",
@@ -27,6 +29,16 @@ DATA_VIEWS = [
     {
         "label": "Estimated Process Downloads",
         "id": "009f6f4b-bff4-4bc7-bc40-fa661b39f566",
+        "suffix": "estimated-process-downloads",
+    },
+    {
+        "label": "Estimated Process Downloads v3",
+        "id": "d46037c2-9957-4afb-9b38-da888f1d04b5",
+        "suffix": "estimated-process-downloads",
+    },
+    {
+        "label": "Estimated Process Downloads v6",
+        "id": "79a23877-e516-4f5e-bb95-cda17a67fe14",
         "suffix": "estimated-process-downloads",
     },
     {
