@@ -14,7 +14,7 @@ DEFAULT_INDEX_VERSION = "v1"
 
 
 # Multiple dashboards reference different historical data view IDs.
-# Update all of them to point to the current annual index.
+# The target index name is constructed from the run label, not hard-coded.
 DATA_VIEWS = [
     {
         "label": "API Calls",
