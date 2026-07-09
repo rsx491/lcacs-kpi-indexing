@@ -83,6 +83,18 @@ DASHBOARDS = [
         "label": "Total Repositories Published",
         "id": "9c19f676-567e-46f6-9b70-04e435a385e8",
     },
+    {
+        "label": "API Availability",
+        "id": "ca569d10-1f5f-42a0-a0f7-233e74d38f60",
+    },
+    {
+        "label": "Active API Tokens",
+        "id": "4da361e1-92ed-452f-a04b-f18eb086a531",
+    },
+    {
+        "label": "Unique Users",
+        "id": "5546c915-b9c6-4afd-9a82-17546158538f",
+    }
 ]
 
 def parse_run_label_dates(run_label: str):

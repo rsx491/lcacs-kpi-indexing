@@ -264,9 +264,10 @@ def build_docs(
     end_date: str = None,
     run_label: str = "manual",
 ):    
-    now = datetime.now(timezone.utc).isoformat()
     docs = []
     warnings = []
+    now = datetime.now(timezone.utc).isoformat()
+    period_timestamp = f"{end_date}T00:00:00.000Z" if end_date else now
 
     for repo_info in sorted(public_repos, key=lambda x: x["repo_path"]):
         repo_path = repo_info["repo_path"]
@@ -320,7 +321,7 @@ def build_docs(
             )
 
         doc = {
-            "@timestamp": now,
+            "@timestamp": period_timestamp,
 
             "repo_path": repo_path,
             "group": repo_info["group"],

@@ -33,3 +33,6 @@ kpi_index_exports/
 
 # Generated logs
 *.log*_validation_summary.json
+*.log
+*.log.gz
+access_2024-09-30_to_2025-10-01.log.gz

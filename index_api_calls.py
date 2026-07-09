@@ -85,7 +85,7 @@ def redact_api_key(request: str) -> str:
     return parsed.path + "?" + "&".join(parts)
 
 
-def classify_endpoint(endpoint: str) -> str:
+def classify_endpoint(endpoint: str):
     if endpoint == "/lca-collaboration/ws/public/search":
         return "search"
 
@@ -101,20 +101,7 @@ def classify_endpoint(endpoint: str) -> str:
     if endpoint.startswith("/lca-collaboration/ws/public/repository/file/"):
         return "repository_file"
 
-    if endpoint.startswith("/lca-collaboration/ws/public/repository/meta/"):
-        return "repository_meta"
-
-    if endpoint.startswith("/lca-collaboration/ws/public/repository/"):
-        return "repository"
-
-    if endpoint.startswith("/lca-collaboration/ws/public/config/"):
-        return "config"
-
-    if endpoint.startswith("/lca-collaboration/ws/public/settings"):
-        return "settings"
-
-    return "other_public_ws"
-
+    return None
 
 def is_documented_api_endpoint_group(group: str) -> bool:
     return group in {
@@ -293,6 +280,8 @@ def parse_log_file(
 
             endpoint = normalize_endpoint(request)
             endpoint_group = classify_endpoint(endpoint)
+            if endpoint_group is None:
+                continue
             is_documented = is_documented_api_endpoint_group(endpoint_group)
 
             parsed = urlparse(request)

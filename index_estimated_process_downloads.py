@@ -245,9 +245,11 @@ def build_docs(
     end_date: str = None,
     run_label: str = "manual",
 ):
+
     docs = []
     warnings = []
     now = datetime.now(timezone.utc).isoformat()
+    period_timestamp = f"{end_date}T00:00:00.000Z" if end_date else now
 
     for repo_path, downloads in sorted(download_counts.items(), key=lambda x: x[1], reverse=True):
         if "/" in repo_path:
@@ -300,7 +302,7 @@ def build_docs(
             )
 
         doc = {
-            "@timestamp": now,
+            "@timestamp": period_timestamp,
 
             "repo_path": repo_path,
             "group": group,
