@@ -128,18 +128,20 @@ def main():
     print(f"ES URL:     {args.es_url}")
     print(f"Dry run:    {args.dry_run}")
 
+    index_names = {
+        kpi["name"]: build_index_name(
+            args.index_prefix, kpi["index_suffix"], run_label, args.index_version
+        )
+        for kpi in KPI_SCRIPTS
+    }
+
     for kpi in KPI_SCRIPTS:
         script_path = repo_root / kpi["script"]
 
         if not script_path.exists():
             raise SystemExit(f"Missing KPI script: {script_path}")
 
-        index_name = build_index_name(
-            args.index_prefix,
-            kpi["index_suffix"],
-            run_label,
-            args.index_version,
-        )
+        index_name = index_names[kpi["name"]]
 
         cmd = [
             sys.executable,
@@ -158,6 +160,12 @@ def main():
             "--end-date", end_date,
             "--run-label", run_label,
         ])
+
+        if kpi["name"] == "estimated_process_downloads":
+            cmd.extend([
+                "--download-index", index_names["public_repo_downloads"],
+                "--inventory-index", index_names["public_process_inventory"],
+            ])
 
         if kpi["name"] == "release_activity":
             events_index_name = build_index_name(

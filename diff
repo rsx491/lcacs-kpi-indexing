@@ -1,0 +1,1590 @@
+diff --git a/README.md b/README.md
+index c4a3605..072ee16 100644
+--- a/README.md
++++ b/README.md
+@@ -26,3 +26,9 @@ Historical script versions are preserved under `archive/`.
+ ## Goal
+ 
+ Build a parameterized KPI indexing framework that can generate indexes for arbitrary date ranges, such as 30-day, annual, or custom reporting periods, from a single execution entry point.
++
++## Event-level time filtering
++
++The estimated process-download KPI was upgraded in script version 2.0.0 to
++preserve each qualifying download event and its original timestamp. See
++`EVENT_LEVEL_KPI_MIGRATION.md` for build, validation, and Kibana migration steps.
+diff --git a/index_estimated_process_downloads.py b/index_estimated_process_downloads.py
+index 8c522df..de3f70c 100755
+--- a/index_estimated_process_downloads.py
++++ b/index_estimated_process_downloads.py
+@@ -3,93 +3,94 @@
+ """
+ LCACS Estimated Process Downloads KPI
+ 
+-Canonical implementation.
+-
+-This script computes the Estimated Process Downloads KPI from:
+-  - Public repository download events
+-  - Validated UNIT_PROCESS counts
+-  - LCACS public browse PROCESS totals
+-
+-Designed to be executed directly or orchestrated by the KPI framework.
+-Runtime parameters (index names, ES URL, etc.) are supplied via command-line arguments.
++Builds an event-level derived KPI index from successful public repository
++``download_prepare`` events. Each output document preserves the original event
++``@timestamp`` and request metadata, then adds the repository process-count
++multipliers used by the estimated-process-download KPI.
++
++Because the output remains event-level, Kibana can correctly aggregate any
++arbitrary date range while retaining client IP, request, user agent, status,
++and other source-event fields.
+ """
+ 
+ SCRIPT_NAME = "index_estimated_process_downloads"
+-SCRIPT_VERSION = "1.0.0"
++SCRIPT_VERSION = "2.0.0"
+ 
+ import argparse
+ import hashlib
+ import json
+ from datetime import datetime, timezone
+-from typing import Dict, Any, Optional
++from typing import Any, Dict, Iterator, Optional, Tuple
+ 
+ import requests
+ 
+-
+ DEFAULT_ES_URL = "http://localhost:9200"
+-DEFAULT_DOWNLOAD_INDEX = "lcacs-kpi-public-repo-downloads-30d-v1"
+-DEFAULT_OLD_UNIT_INDEX = "lcacs-kpi-estimated-unit-process-downloads-poc"
+-DEFAULT_TARGET_INDEX = "lcacs-kpi-estimated-process-downloads-30d-v5"
+-
++DEFAULT_DOWNLOAD_INDEX = "lcacs-kpi-public-repo-downloads"
++DEFAULT_INVENTORY_INDEX = "lcacs-kpi-public-process-inventory-v1"
++DEFAULT_TARGET_INDEX = "lcacs-kpi-estimated-process-downloads"
+ LCACS_BROWSE_BASE = "https://www.lcacommons.gov/lca-collaboration/ws/public/browse"
+ 
++SOURCE_FIELDS = [
++    "@timestamp", "host", "client_ip", "method", "request", "endpoint",
++    "status", "bytes", "referrer", "user_agent", "upstream", "request_time",
++    "download_event_type", "group", "repo", "repo_path", "commit_id",
++    "is_public_repo", "is_repo_identifiable",
++]
+ 
+-# ============================================================================
+-# Elasticsearch Helpers
+-# ============================================================================
+-
+-def es_request(method: str, es_url: str, path: str, payload: Optional[dict] = None) -> dict:
+-    url = f"{es_url}/{path.lstrip('/')}"
+-    kwargs = {"timeout": 120}
+ 
++def es_request(method: str, es_url: str, path: str, payload: Optional[dict] = None,
++               timeout: int = 120) -> dict:
++    url = f"{es_url.rstrip('/')}/{path.lstrip('/')}"
++    kwargs: Dict[str, Any] = {"timeout": timeout}
+     if payload is not None:
+-        kwargs["headers"] = {"Content-Type": "application/json"}
+-        kwargs["data"] = json.dumps(payload)
+-
++        kwargs["json"] = payload
+     resp = requests.request(method, url, **kwargs)
+-
+     if not resp.ok:
+         raise RuntimeError(f"{method} {url} failed: {resp.status_code} {resp.text}")
+-
+     return resp.json() if resp.text else {}
+ 
+ 
+-# ============================================================================
+-# Index Management
+-# ============================================================================
+-
+-def create_target_index(es_url: str, index: str, recreate: bool = False):
++def create_target_index(es_url: str, index: str, recreate: bool = False) -> None:
+     mapping = {
++        "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+         "mappings": {
+             "properties": {
+                 "@timestamp": {"type": "date"},
+-
++                "source_event_id": {"type": "keyword"},
++                "source_event_index": {"type": "keyword"},
++                "host": {"type": "keyword"},
++                "client_ip": {"type": "ip"},
++                "method": {"type": "keyword"},
++                "request": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4096}}},
++                "endpoint": {"type": "keyword"},
++                "status": {"type": "integer"},
++                "bytes": {"type": "long"},
++                "referrer": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4096}}},
++                "user_agent": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4096}}},
++                "upstream": {"type": "keyword"},
++                "request_time": {"type": "float"},
++                "download_event_type": {"type": "keyword"},
+                 "repo_path": {"type": "keyword"},
+                 "group": {"type": "keyword"},
+                 "repo": {"type": "keyword"},
+                 "commit_id": {"type": "keyword"},
+-
++                "is_public_repo": {"type": "boolean"},
++                "is_repo_identifiable": {"type": "boolean"},
+                 "completed_public_repo_downloads": {"type": "long"},
+-
+                 "current_unit_process_count": {"type": "long"},
+                 "current_lci_result_count": {"type": "long"},
+                 "current_total_process_count": {"type": "long"},
+-
+                 "estimated_unit_process_downloads": {"type": "long"},
+                 "estimated_lci_result_downloads": {"type": "long"},
+                 "estimated_total_process_downloads": {"type": "long"},
+-
+                 "unit_process_count_source": {"type": "keyword"},
+                 "total_process_count_source": {"type": "keyword"},
+                 "lci_result_count_source": {"type": "keyword"},
+-
+                 "process_count_status": {"type": "keyword"},
+                 "process_count_note": {"type": "text"},
+-
+                 "download_count_source": {"type": "keyword"},
+                 "source": {"type": "keyword"},
+                 "kpi_name": {"type": "keyword"},
+-
+                 "script_name": {"type": "keyword"},
+                 "script_version": {"type": "keyword"},
+                 "run_label": {"type": "keyword"},
+@@ -97,408 +98,242 @@ def create_target_index(es_url: str, index: str, recreate: bool = False):
+                 "kpi_period_end": {"type": "date"},
+                 "generated_at": {"type": "date"},
+             }
+-        }
++        },
+     }
+-
+     if recreate:
+-        requests.delete(f"{es_url}/{index}", timeout=60)
+-
+-    exists = requests.head(f"{es_url}/{index}", timeout=30).status_code == 200
+-    if exists:
++        requests.delete(f"{es_url.rstrip('/')}/{index}", timeout=60)
++    if requests.head(f"{es_url.rstrip('/')}/{index}", timeout=30).status_code == 200:
+         print(f"Index already exists: {index}")
+         return
+-
+     es_request("PUT", es_url, index, mapping)
+     print(f"Created index: {index}")
+ 
+ 
+-# ============================================================================
+-# Source Data Collection
+-# ============================================================================
+-
+-def get_public_repo_download_counts(es_url: str, download_index: str) -> Dict[str, int]:
+-    payload = {
+-        "size": 0,
+-        "query": {
+-            "bool": {
+-                "filter": [
+-                    {"term": {"download_event_type": "download_prepare"}},
+-                    {"range": {"status": {"gte": 200, "lt": 300}}}
+-                ]
+-            }
+-        },
+-        "aggs": {
+-            "by_repo": {
+-                "terms": {
+-                    "field": "repo_path",
+-                    "size": 1000,
+-                    "order": {"_count": "desc"}
+-                }
+-            }
+-        }
+-    }
+-
+-    data = es_request("GET", es_url, f"{download_index}/_search", payload)
+-    buckets = data.get("aggregations", {}).get("by_repo", {}).get("buckets", [])
+-
+-    return {bucket["key"]: int(bucket["doc_count"]) for bucket in buckets}
+-
+-
+-def get_old_validated_unit_counts(es_url: str, old_index: str) -> Dict[str, Dict[str, Any]]:
++def get_inventory(es_url: str, inventory_index: str) -> Dict[str, Dict[str, Any]]:
+     payload = {
+         "size": 1000,
+         "_source": [
+-            "repo_path",
+-            "repository_path",
+-            "agency_repo",
+-            "group",
+-            "repo",
+-            "current_unit_process_count",
+-            "unit_process_count"
++            "repo_path", "group", "repo", "commit_id",
++            "current_unit_process_count", "current_lci_result_count",
++            "current_total_process_count", "process_count_status",
++            "process_count_note", "unit_process_count_source",
++            "total_process_count_source", "lci_result_count_source",
+         ],
+-        "query": {"match_all": {}}
++        "query": {"match_all": {}},
++    }
++    data = es_request("GET", es_url, f"{inventory_index}/_search", payload)
++    return {
++        hit["_source"]["repo_path"]: hit["_source"]
++        for hit in data.get("hits", {}).get("hits", [])
++        if hit.get("_source", {}).get("repo_path")
+     }
+-
+-    data = es_request("GET", es_url, f"{old_index}/_search", payload)
+-
+-    results = {}
+-
+-    for hit in data.get("hits", {}).get("hits", []):
+-        src = hit.get("_source", {})
+-
+-        repo_path = src.get("repo_path") or src.get("repository_path") or src.get("agency_repo")
+-        if not repo_path:
+-            continue
+-
+-        group = src.get("group")
+-        repo = src.get("repo")
+-
+-        if (not group or not repo) and "/" in repo_path:
+-            group, repo = repo_path.split("/", 1)
+-
+-        unit_count = src.get("current_unit_process_count")
+-        if unit_count is None:
+-            unit_count = src.get("unit_process_count", 0)
+-
+-        results[repo_path] = {
+-            "repo_path": repo_path,
+-            "group": group,
+-            "repo": repo,
+-            "current_unit_process_count": int(unit_count or 0)
+-        }
+-
+-    return results
+ 
+ 
+ def get_total_process_count_from_browse(repo_path: str) -> Dict[str, Any]:
+     if "/" not in repo_path:
+-        return {
+-            "current_total_process_count": 0,
+-            "commit_id": None,
+-            "status": "bad_repo_path",
+-            "note": "Could not split repo_path into group/repo."
+-        }
+-
++        return {"current_total_process_count": 0, "commit_id": None,
++                "status": "bad_repo_path", "note": "Invalid repo_path."}
+     group, repo = repo_path.split("/", 1)
+-    url = f"{LCACS_BROWSE_BASE}/{group}/{repo}"
+-
+     try:
+-        resp = requests.get(url, timeout=120)
++        resp = requests.get(f"{LCACS_BROWSE_BASE}/{group}/{repo}", timeout=120)
+         resp.raise_for_status()
+-        data = resp.json()
+-
+-        for entry in data.get("data", []):
++        for entry in resp.json().get("data", []):
+             if entry.get("type") == "PROCESS" and entry.get("typeOfEntry") == "MODEL_TYPE":
+-                return {
+-                    "current_total_process_count": int(entry.get("count", 0) or 0),
+-                    "commit_id": entry.get("commitId"),
+-                    "status": "available",
+-                    "note": "Total PROCESS count pulled from repo-scoped public browse endpoint."
+-                }
+-
+-        return {
+-            "current_total_process_count": 0,
+-            "commit_id": None,
+-            "status": "missing_process_entry",
+-            "note": "Browse endpoint response did not contain a PROCESS model-type entry."
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "current_total_process_count": 0,
+-            "commit_id": None,
+-            "status": "api_error",
+-            "note": f"Browse endpoint lookup failed: {e}"
+-        }
+-
+-
+-# ============================================================================
+-# KPI Construction
+-# ============================================================================
+-
+-def build_docs(
+-    download_counts: Dict[str, int],
+-    old_unit_counts: Dict[str, Dict[str, Any]],
+-    download_index: str,
+-    old_unit_index: str,
+-    start_date: str = None,
+-    end_date: str = None,
+-    run_label: str = "manual",
+-):
+-
+-    docs = []
+-    warnings = []
+-    now = datetime.now(timezone.utc).isoformat()
+-    period_timestamp = f"{end_date}T00:00:00.000Z" if end_date else now
+-
+-    for repo_path, downloads in sorted(download_counts.items(), key=lambda x: x[1], reverse=True):
+-        if "/" in repo_path:
+-            group, repo = repo_path.split("/", 1)
+-        else:
+-            group, repo = None, repo_path
+-
+-        old = old_unit_counts.get(repo_path)
+-        unit_count = int(old.get("current_unit_process_count", 0)) if old else 0
+-
++                return {"current_total_process_count": int(entry.get("count", 0) or 0),
++                        "commit_id": entry.get("commitId"), "status": "available",
++                        "note": "PROCESS total from public browse endpoint."}
++        return {"current_total_process_count": 0, "commit_id": None,
++                "status": "missing_process_entry", "note": "No PROCESS entry in browse response."}
++    except Exception as exc:
++        return {"current_total_process_count": 0, "commit_id": None,
++                "status": "api_error", "note": f"Browse lookup failed: {exc}"}
++
++
++def build_enrichment(repo_path: str, inventory: Dict[str, Dict[str, Any]],
++                     inventory_index: str) -> Tuple[Dict[str, Any], Optional[str]]:
++    inv = inventory.get(repo_path, {})
++    unit_count = int(inv.get("current_unit_process_count", 0) or 0)
++    lci_count = int(inv.get("current_lci_result_count", 0) or 0)
++    total_count = int(inv.get("current_total_process_count", 0) or 0)
++    commit_id = inv.get("commit_id")
++    status = inv.get("process_count_status")
++    note = inv.get("process_count_note")
++
++    if total_count <= 0:
+         browse = get_total_process_count_from_browse(repo_path)
+-        total_count = int(browse["current_total_process_count"] or 0)
+-
+-        if total_count > 0:
+-            if unit_count > 0:
+-                if total_count >= unit_count:
+-                    lci_count = max(total_count - unit_count, 0)
+-                    status = "available"
+-                    note = (
+-                        "Total PROCESS count pulled from repo-scoped browse endpoint. "
+-                        "UNIT_PROCESS count pulled from validated unit-count index. "
+-                        "LCI_RESULT/System Process count derived as PROCESS total minus UNIT_PROCESS."
+-                    )
+-                else:
+-                    total_count = unit_count
+-                    lci_count = 0
+-                    status = "fallback_validated_unit_count_browse_conflict"
+-                    note = (
+-                        "Browse PROCESS total was lower than validated UNIT_PROCESS count. "
+-                        "Using validated UNIT_PROCESS count as total. "
+-                        "LCI_RESULT/System Process count set to 0 because the browse total "
+-                        "could not safely be reconciled."
+-                    )
+-            else:
+-                unit_count = total_count
+-                lci_count = 0
+-                status = "inferred_unit_process_count_from_public_process_total"
+-                note = (
+-                    "Total PROCESS count pulled from repo-scoped browse endpoint, but no validated "
+-                    "UNIT_PROCESS/LCI_RESULT split was available. For the unit-process KPI, the public "
+-                    "PROCESS total is counted as UNIT_PROCESS unless a System Process split is later validated."
+-                )
++        total_count = int(browse.get("current_total_process_count", 0) or 0)
++        commit_id = commit_id or browse.get("commit_id")
++        if total_count > 0 and unit_count > 0 and total_count >= unit_count:
++            lci_count = total_count - unit_count
++            status = "available"
++            note = "PROCESS total from browse; UNIT_PROCESS from inventory; LCI_RESULT derived."
++        elif total_count > 0 and unit_count <= 0:
++            unit_count = total_count
++            lci_count = 0
++            status = "inferred_unit_process_count_from_public_process_total"
++            note = "No validated split; PROCESS total treated as UNIT_PROCESS."
+         else:
+             total_count = unit_count
+             lci_count = 0
+             status = "fallback_unit_only"
+-            note = (
+-                f"{browse['note']} Falling back to validated UNIT_PROCESS count only; "
+-                "LCI_RESULT/System Process count unavailable."
+-            )
+-
+-        doc = {
+-            "@timestamp": period_timestamp,
+-
+-            "repo_path": repo_path,
+-            "group": group,
+-            "repo": repo,
+-            "commit_id": browse.get("commit_id"),
+-
+-            "completed_public_repo_downloads": int(downloads),
+-
+-            "current_unit_process_count": int(unit_count),
+-            "current_lci_result_count": int(lci_count),
+-            "current_total_process_count": int(total_count),
+-
+-            "estimated_unit_process_downloads": int(downloads) * int(unit_count),
+-            "estimated_lci_result_downloads": int(downloads) * int(lci_count),
+-            "estimated_total_process_downloads": int(downloads) * int(total_count),
+-
+-            "unit_process_count_source": old_unit_index if old else "missing_validated_unit_count",
+-            "total_process_count_source": "lcacs_public_browse_endpoint" if browse["status"] == "available" else "fallback_or_missing",
+-            "lci_result_count_source": "derived_total_minus_unit" if status == "available" else "unavailable_or_not_derived",
+-
+-            "process_count_status": status,
+-            "process_count_note": note,
++            note = f"{browse.get('note', '')} Falling back to UNIT_PROCESS count."
++
++    enrichment = {
++        "commit_id": commit_id,
++        "current_unit_process_count": unit_count,
++        "current_lci_result_count": lci_count,
++        "current_total_process_count": total_count,
++        "unit_process_count_source": inv.get("unit_process_count_source", inventory_index if inv else "missing"),
++        "total_process_count_source": inv.get("total_process_count_source", "inventory_or_browse"),
++        "lci_result_count_source": inv.get("lci_result_count_source", "inventory_or_derived"),
++        "process_count_status": status or "unknown",
++        "process_count_note": note or "",
++    }
++    warning = None if enrichment["process_count_status"] == "available" else f"{repo_path}: {enrichment['process_count_status']}"
++    return enrichment, warning
++
++
++def iter_download_events(es_url: str, download_index: str, start_date: Optional[str],
++                         end_date: Optional[str], page_size: int = 5000) -> Iterator[dict]:
++    filters = [
++        {"term": {"download_event_type": "download_prepare"}},
++        {"range": {"status": {"gte": 200, "lt": 300}}},
++    ]
++    if start_date or end_date:
++        bounds: Dict[str, str] = {}
++        if start_date:
++            bounds["gte"] = f"{start_date}T00:00:00Z"
++        if end_date:
++            bounds["lt"] = f"{end_date}T00:00:00Z"
++        filters.append({"range": {"@timestamp": bounds}})
+ 
++    payload = {
++        "size": page_size,
++        "_source": SOURCE_FIELDS,
++        "query": {"bool": {"filter": filters}},
++        "sort": ["_doc"],
++    }
++    data = es_request("POST", es_url, f"{download_index}/_search?scroll=2m", payload)
++    scroll_id = data.get("_scroll_id")
++    try:
++        while True:
++            hits = data.get("hits", {}).get("hits", [])
++            if not hits:
++                break
++            yield from hits
++            data = es_request("POST", es_url, "_search/scroll", {"scroll": "2m", "scroll_id": scroll_id})
++            scroll_id = data.get("_scroll_id", scroll_id)
++    finally:
++        if scroll_id:
++            try:
++                es_request("DELETE", es_url, "_search/scroll", {"scroll_id": [scroll_id]})
++            except Exception:
++                pass
++
++
++def bulk_index(es_url: str, target_index: str, actions: list) -> None:
++    if not actions:
++        return
++    payload = "\n".join(json.dumps(item, separators=(",", ":")) for item in actions) + "\n"
++    resp = requests.post(f"{es_url.rstrip('/')}/_bulk", data=payload,
++                         headers={"Content-Type": "application/x-ndjson"}, timeout=180)
++    if not resp.ok:
++        raise RuntimeError(f"Bulk failed: {resp.status_code} {resp.text}")
++    result = resp.json()
++    if result.get("errors"):
++        errors = [x for x in result.get("items", []) if x.get("index", {}).get("error")]
++        raise RuntimeError(f"Bulk contained errors: {json.dumps(errors[:5])}")
++
++
++def run(es_url: str, download_index: str, inventory_index: str, target_index: str,
++        start_date: Optional[str], end_date: Optional[str], run_label: str,
++        dry_run: bool, batch_size: int = 5000) -> None:
++    inventory = get_inventory(es_url, inventory_index)
++    enrichment_cache: Dict[str, Dict[str, Any]] = {}
++    warnings = set()
++    generated_at = datetime.now(timezone.utc).isoformat()
++    actions = []
++    events = 0
++    estimated_total = 0
++
++    for hit in iter_download_events(es_url, download_index, start_date, end_date):
++        src = hit.get("_source", {})
++        repo_path = src.get("repo_path")
++        if not repo_path:
++            continue
++        if repo_path not in enrichment_cache:
++            enrichment, warning = build_enrichment(repo_path, inventory, inventory_index)
++            enrichment_cache[repo_path] = enrichment
++            if warning:
++                warnings.add(warning)
++        enrichment = enrichment_cache[repo_path]
++
++        unit = int(enrichment["current_unit_process_count"])
++        lci = int(enrichment["current_lci_result_count"])
++        total = int(enrichment["current_total_process_count"])
++        doc = dict(src)
++        doc.update(enrichment)
++        doc.update({
++            "source_event_id": hit.get("_id"),
++            "source_event_index": hit.get("_index"),
++            "completed_public_repo_downloads": 1,
++            "estimated_unit_process_downloads": unit,
++            "estimated_lci_result_downloads": lci,
++            "estimated_total_process_downloads": total,
+             "download_count_source": download_index,
+-            "source": "lcacs_kpi_enrichment",
++            "source": "lcacs_kpi_event_enrichment",
+             "kpi_name": "estimated_process_downloads",
+-
+             "script_name": SCRIPT_NAME,
+             "script_version": SCRIPT_VERSION,
+             "run_label": run_label,
+             "kpi_period_start": start_date,
+             "kpi_period_end": end_date,
+-            "generated_at": now,
+-        }
+-
+-        if status != "available":
+-            warnings.append(f"{repo_path}: {status} - {note}")
+-
+-        docs.append(doc)
+-
+-    return docs, warnings
+-
+-
+-# ============================================================================
+-# Output
+-# ============================================================================
+-
+-def bulk_index(es_url: str, index: str, docs: list):
+-    if not docs:
+-        print("No docs to index.")
+-        return
+-
+-    lines = []
+-
+-    for doc in docs:
+-        doc_id = hashlib.sha1(doc["repo_path"].encode("utf-8")).hexdigest()
+-        lines.append({"index": {"_index": index, "_id": doc_id}})
+-        lines.append(doc)
+-
+-    payload = "\n".join(json.dumps(x) for x in lines) + "\n"
+-
+-    resp = requests.post(
+-        f"{es_url}/_bulk",
+-        headers={"Content-Type": "application/x-ndjson"},
+-        data=payload,
+-        timeout=120
+-    )
+-
+-    if not resp.ok:
+-        raise RuntimeError(f"Bulk failed: {resp.status_code} {resp.text}")
+-
+-    result = resp.json()
+-    if result.get("errors"):
+-        raise RuntimeError(f"Bulk had errors: {json.dumps(result)[:3000]}")
+-
+-
+-def print_summary(
+-    docs: list,
+-    warnings: list,
+-    start_date: str = None,
+-    end_date: str = None,
+-    run_label: str = "manual",
+-    dry_run: bool = False,
+-):
+-    total_downloads = sum(d["completed_public_repo_downloads"] for d in docs)
+-
+-    total_unit = sum(d["current_unit_process_count"] for d in docs)
+-    total_lci = sum(d["current_lci_result_count"] for d in docs)
+-    total_process = sum(d["current_total_process_count"] for d in docs)
+-
+-    est_unit = sum(d["estimated_unit_process_downloads"] for d in docs)
+-    est_lci = sum(d["estimated_lci_result_downloads"] for d in docs)
+-    est_total = sum(d["estimated_total_process_downloads"] for d in docs)
+-
+-    available = sum(1 for d in docs if d["process_count_status"] == "available")
+-    not_available = len(docs) - available
+-
+-    print("\n=== ESTIMATED PROCESS DOWNLOADS SUMMARY ===")
+-    print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+-    print(f"Run label: {run_label}")
+-    print(f"KPI period: {start_date} to {end_date}")
++            "generated_at": generated_at,
++        })
++        raw_id = f"{hit.get('_index')}|{hit.get('_id')}|{SCRIPT_VERSION}"
++        doc_id = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()
++        actions.extend([{"index": {"_index": target_index, "_id": doc_id}}, doc])
++        events += 1
++        estimated_total += total
++
++        if len(actions) >= batch_size * 2:
++            if not dry_run:
++                bulk_index(es_url, target_index, actions)
++            actions.clear()
++
++    if actions and not dry_run:
++        bulk_index(es_url, target_index, actions)
++
++    print("\n=== ESTIMATED PROCESS DOWNLOADS EVENT-LEVEL SUMMARY ===")
++    print(f"Source events indexed: {events:,}")
++    print(f"Repositories enriched: {len(enrichment_cache):,}")
++    print(f"Estimated total process downloads: {estimated_total:,}")
++    print(f"KPI period: {start_date} to {end_date} (end exclusive)")
+     print(f"Dry run: {dry_run}")
+-    print(f"Repositories indexed: {len(docs):,}")
+-    print(f"Repositories with full derived process counts: {available:,}")
+-    print(f"Repositories needing review/fallback: {not_available:,}")
+-
+-    print(f"Completed public repo downloads: {total_downloads:,}")
+-
+-    print(f"Current UNIT_PROCESS count across downloaded repos: {total_unit:,}")
+-    print(f"Current LCI_RESULT/System Process count across downloaded repos: {total_lci:,}")
+-    print(f"Current total PROCESS count across downloaded repos: {total_process:,}")
+-
+-    print(f"Estimated UNIT_PROCESS downloads: {est_unit:,}")
+-    print(f"Estimated LCI_RESULT/System Process downloads: {est_lci:,}")
+-    print(f"Estimated total PROCESS downloads: {est_total:,}")
+-
+-    print("\nTop 20 repos by estimated total PROCESS downloads:")
+-    for d in sorted(docs, key=lambda x: x["estimated_total_process_downloads"], reverse=True)[:20]:
+-        print(
+-            f"  {d['estimated_total_process_downloads']:,}\t"
+-            f"{d['repo_path']}\t"
+-            f"downloads={d['completed_public_repo_downloads']:,}\t"
+-            f"unit={d['current_unit_process_count']:,}\t"
+-            f"lci={d['current_lci_result_count']:,}\t"
+-            f"total={d['current_total_process_count']:,}\t"
+-            f"status={d['process_count_status']}"
+-        )
+-
+     if warnings:
+-        print("\nWARNINGS:")
+-        for warning in warnings:
++        print("Warnings:")
++        for warning in sorted(warnings):
+             print(f"  {warning}")
+ 
+ 
+-# ============================================================================
+-# Entry Point
+-# ============================================================================
+-
+-def main():
+-    parser = argparse.ArgumentParser(
+-        description="Create estimated process-download KPI index using public downloads and repo-scoped browse PROCESS totals."
+-    )
+-
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Build event-level estimated process-download KPI index.")
+     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
+     parser.add_argument("--download-index", default=DEFAULT_DOWNLOAD_INDEX)
+-    parser.add_argument("--old-unit-index", default=DEFAULT_OLD_UNIT_INDEX)
+-
+-    parser.add_argument(
+-        "--target-index",
+-        "--index",
+-        dest="target_index",
+-        default=DEFAULT_TARGET_INDEX,
+-    )
+-
++    parser.add_argument("--inventory-index", "--old-unit-index", dest="inventory_index", default=DEFAULT_INVENTORY_INDEX)
++    parser.add_argument("--target-index", "--index", dest="target_index", default=DEFAULT_TARGET_INDEX)
+     parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+     parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+     parser.add_argument("--run-label", default="manual")
++    parser.add_argument("--batch-size", type=int, default=5000)
+     parser.add_argument("--recreate", action="store_true")
+     parser.add_argument("--dry-run", action="store_true")
+-
+     args = parser.parse_args()
+ 
+     create_target_index(args.es_url, args.target_index, recreate=args.recreate)
+-
+-    print(f"Reading download counts from: {args.download_index}")
+-    download_counts = get_public_repo_download_counts(args.es_url, args.download_index)
+-    print(f"Found public repo download counts for {len(download_counts):,} repos.")
+-
+-    print(f"Reading validated UNIT_PROCESS counts from: {args.old_unit_index}")
+-    old_unit_counts = get_old_validated_unit_counts(args.es_url, args.old_unit_index)
+-    print(f"Found validated UNIT_PROCESS counts for {len(old_unit_counts):,} repos.")
+-
+-    docs, warnings = build_docs(
+-        download_counts=download_counts,
+-        old_unit_counts=old_unit_counts,
+-        download_index=args.download_index,
+-        old_unit_index=args.old_unit_index,
+-        start_date=args.start_date,
+-        end_date=args.end_date,
+-        run_label=args.run_label,
+-    )
+-
+-    if not args.dry_run:
+-        bulk_index(args.es_url, args.target_index, docs)
+-    else:
+-        print("Dry run enabled; skipping bulk index.")
+-
+-    print_summary(
+-        docs,
+-        warnings,
+-        start_date=args.start_date,
+-        end_date=args.end_date,
+-        run_label=args.run_label,
+-        dry_run=args.dry_run,
+-    )
++    run(args.es_url, args.download_index, args.inventory_index, args.target_index,
++        args.start_date, args.end_date, args.run_label, args.dry_run, args.batch_size)
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/run_kpi_framework.py b/run_kpi_framework.py
+index 9fdd0be..f1dcd14 100644
+--- a/run_kpi_framework.py
++++ b/run_kpi_framework.py
+@@ -128,18 +128,20 @@ def main():
+     print(f"ES URL:     {args.es_url}")
+     print(f"Dry run:    {args.dry_run}")
+ 
++    index_names = {
++        kpi["name"]: build_index_name(
++            args.index_prefix, kpi["index_suffix"], run_label, args.index_version
++        )
++        for kpi in KPI_SCRIPTS
++    }
++
+     for kpi in KPI_SCRIPTS:
+         script_path = repo_root / kpi["script"]
+ 
+         if not script_path.exists():
+             raise SystemExit(f"Missing KPI script: {script_path}")
+ 
+-        index_name = build_index_name(
+-            args.index_prefix,
+-            kpi["index_suffix"],
+-            run_label,
+-            args.index_version,
+-        )
++        index_name = index_names[kpi["name"]]
+ 
+         cmd = [
+             sys.executable,
+@@ -159,6 +161,12 @@ def main():
+             "--run-label", run_label,
+         ])
+ 
++        if kpi["name"] == "estimated_process_downloads":
++            cmd.extend([
++                "--download-index", index_names["public_repo_downloads"],
++                "--inventory-index", index_names["public_process_inventory"],
++            ])
++
+         if kpi["name"] == "release_activity":
+             events_index_name = build_index_name(
+                 args.index_prefix,
+diff --git a/README.md b/README.md
+index c4a3605..072ee16 100644
+--- a/README.md
++++ b/README.md
+@@ -26,3 +26,9 @@ Historical script versions are preserved under `archive/`.
+ ## Goal
+ 
+ Build a parameterized KPI indexing framework that can generate indexes for arbitrary date ranges, such as 30-day, annual, or custom reporting periods, from a single execution entry point.
++
++## Event-level time filtering
++
++The estimated process-download KPI was upgraded in script version 2.0.0 to
++preserve each qualifying download event and its original timestamp. See
++`EVENT_LEVEL_KPI_MIGRATION.md` for build, validation, and Kibana migration steps.
+diff --git a/index_estimated_process_downloads.py b/index_estimated_process_downloads.py
+index 8c522df..de3f70c 100755
+--- a/index_estimated_process_downloads.py
++++ b/index_estimated_process_downloads.py
+@@ -3,93 +3,94 @@
+ """
+ LCACS Estimated Process Downloads KPI
+ 
+-Canonical implementation.
+-
+-This script computes the Estimated Process Downloads KPI from:
+-  - Public repository download events
+-  - Validated UNIT_PROCESS counts
+-  - LCACS public browse PROCESS totals
+-
+-Designed to be executed directly or orchestrated by the KPI framework.
+-Runtime parameters (index names, ES URL, etc.) are supplied via command-line arguments.
++Builds an event-level derived KPI index from successful public repository
++``download_prepare`` events. Each output document preserves the original event
++``@timestamp`` and request metadata, then adds the repository process-count
++multipliers used by the estimated-process-download KPI.
++
++Because the output remains event-level, Kibana can correctly aggregate any
++arbitrary date range while retaining client IP, request, user agent, status,
++and other source-event fields.
+ """
+ 
+ SCRIPT_NAME = "index_estimated_process_downloads"
+-SCRIPT_VERSION = "1.0.0"
++SCRIPT_VERSION = "2.0.0"
+ 
+ import argparse
+ import hashlib
+ import json
+ from datetime import datetime, timezone
+-from typing import Dict, Any, Optional
++from typing import Any, Dict, Iterator, Optional, Tuple
+ 
+ import requests
+ 
+-
+ DEFAULT_ES_URL = "http://localhost:9200"
+-DEFAULT_DOWNLOAD_INDEX = "lcacs-kpi-public-repo-downloads-30d-v1"
+-DEFAULT_OLD_UNIT_INDEX = "lcacs-kpi-estimated-unit-process-downloads-poc"
+-DEFAULT_TARGET_INDEX = "lcacs-kpi-estimated-process-downloads-30d-v5"
+-
++DEFAULT_DOWNLOAD_INDEX = "lcacs-kpi-public-repo-downloads"
++DEFAULT_INVENTORY_INDEX = "lcacs-kpi-public-process-inventory-v1"
++DEFAULT_TARGET_INDEX = "lcacs-kpi-estimated-process-downloads"
+ LCACS_BROWSE_BASE = "https://www.lcacommons.gov/lca-collaboration/ws/public/browse"
+ 
++SOURCE_FIELDS = [
++    "@timestamp", "host", "client_ip", "method", "request", "endpoint",
++    "status", "bytes", "referrer", "user_agent", "upstream", "request_time",
++    "download_event_type", "group", "repo", "repo_path", "commit_id",
++    "is_public_repo", "is_repo_identifiable",
++]
+ 
+-# ============================================================================
+-# Elasticsearch Helpers
+-# ============================================================================
+-
+-def es_request(method: str, es_url: str, path: str, payload: Optional[dict] = None) -> dict:
+-    url = f"{es_url}/{path.lstrip('/')}"
+-    kwargs = {"timeout": 120}
+ 
++def es_request(method: str, es_url: str, path: str, payload: Optional[dict] = None,
++               timeout: int = 120) -> dict:
++    url = f"{es_url.rstrip('/')}/{path.lstrip('/')}"
++    kwargs: Dict[str, Any] = {"timeout": timeout}
+     if payload is not None:
+-        kwargs["headers"] = {"Content-Type": "application/json"}
+-        kwargs["data"] = json.dumps(payload)
+-
++        kwargs["json"] = payload
+     resp = requests.request(method, url, **kwargs)
+-
+     if not resp.ok:
+         raise RuntimeError(f"{method} {url} failed: {resp.status_code} {resp.text}")
+-
+     return resp.json() if resp.text else {}
+ 
+ 
+-# ============================================================================
+-# Index Management
+-# ============================================================================
+-
+-def create_target_index(es_url: str, index: str, recreate: bool = False):
++def create_target_index(es_url: str, index: str, recreate: bool = False) -> None:
+     mapping = {
++        "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+         "mappings": {
+             "properties": {
+                 "@timestamp": {"type": "date"},
+-
++                "source_event_id": {"type": "keyword"},
++                "source_event_index": {"type": "keyword"},
++                "host": {"type": "keyword"},
++                "client_ip": {"type": "ip"},
++                "method": {"type": "keyword"},
++                "request": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4096}}},
++                "endpoint": {"type": "keyword"},
++                "status": {"type": "integer"},
++                "bytes": {"type": "long"},
++                "referrer": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4096}}},
++                "user_agent": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 4096}}},
++                "upstream": {"type": "keyword"},
++                "request_time": {"type": "float"},
++                "download_event_type": {"type": "keyword"},
+                 "repo_path": {"type": "keyword"},
+                 "group": {"type": "keyword"},
+                 "repo": {"type": "keyword"},
+                 "commit_id": {"type": "keyword"},
+-
++                "is_public_repo": {"type": "boolean"},
++                "is_repo_identifiable": {"type": "boolean"},
+                 "completed_public_repo_downloads": {"type": "long"},
+-
+                 "current_unit_process_count": {"type": "long"},
+                 "current_lci_result_count": {"type": "long"},
+                 "current_total_process_count": {"type": "long"},
+-
+                 "estimated_unit_process_downloads": {"type": "long"},
+                 "estimated_lci_result_downloads": {"type": "long"},
+                 "estimated_total_process_downloads": {"type": "long"},
+-
+                 "unit_process_count_source": {"type": "keyword"},
+                 "total_process_count_source": {"type": "keyword"},
+                 "lci_result_count_source": {"type": "keyword"},
+-
+                 "process_count_status": {"type": "keyword"},
+                 "process_count_note": {"type": "text"},
+-
+                 "download_count_source": {"type": "keyword"},
+                 "source": {"type": "keyword"},
+                 "kpi_name": {"type": "keyword"},
+-
+                 "script_name": {"type": "keyword"},
+                 "script_version": {"type": "keyword"},
+                 "run_label": {"type": "keyword"},
+@@ -97,408 +98,242 @@ def create_target_index(es_url: str, index: str, recreate: bool = False):
+                 "kpi_period_end": {"type": "date"},
+                 "generated_at": {"type": "date"},
+             }
+-        }
++        },
+     }
+-
+     if recreate:
+-        requests.delete(f"{es_url}/{index}", timeout=60)
+-
+-    exists = requests.head(f"{es_url}/{index}", timeout=30).status_code == 200
+-    if exists:
++        requests.delete(f"{es_url.rstrip('/')}/{index}", timeout=60)
++    if requests.head(f"{es_url.rstrip('/')}/{index}", timeout=30).status_code == 200:
+         print(f"Index already exists: {index}")
+         return
+-
+     es_request("PUT", es_url, index, mapping)
+     print(f"Created index: {index}")
+ 
+ 
+-# ============================================================================
+-# Source Data Collection
+-# ============================================================================
+-
+-def get_public_repo_download_counts(es_url: str, download_index: str) -> Dict[str, int]:
+-    payload = {
+-        "size": 0,
+-        "query": {
+-            "bool": {
+-                "filter": [
+-                    {"term": {"download_event_type": "download_prepare"}},
+-                    {"range": {"status": {"gte": 200, "lt": 300}}}
+-                ]
+-            }
+-        },
+-        "aggs": {
+-            "by_repo": {
+-                "terms": {
+-                    "field": "repo_path",
+-                    "size": 1000,
+-                    "order": {"_count": "desc"}
+-                }
+-            }
+-        }
+-    }
+-
+-    data = es_request("GET", es_url, f"{download_index}/_search", payload)
+-    buckets = data.get("aggregations", {}).get("by_repo", {}).get("buckets", [])
+-
+-    return {bucket["key"]: int(bucket["doc_count"]) for bucket in buckets}
+-
+-
+-def get_old_validated_unit_counts(es_url: str, old_index: str) -> Dict[str, Dict[str, Any]]:
++def get_inventory(es_url: str, inventory_index: str) -> Dict[str, Dict[str, Any]]:
+     payload = {
+         "size": 1000,
+         "_source": [
+-            "repo_path",
+-            "repository_path",
+-            "agency_repo",
+-            "group",
+-            "repo",
+-            "current_unit_process_count",
+-            "unit_process_count"
++            "repo_path", "group", "repo", "commit_id",
++            "current_unit_process_count", "current_lci_result_count",
++            "current_total_process_count", "process_count_status",
++            "process_count_note", "unit_process_count_source",
++            "total_process_count_source", "lci_result_count_source",
+         ],
+-        "query": {"match_all": {}}
++        "query": {"match_all": {}},
++    }
++    data = es_request("GET", es_url, f"{inventory_index}/_search", payload)
++    return {
++        hit["_source"]["repo_path"]: hit["_source"]
++        for hit in data.get("hits", {}).get("hits", [])
++        if hit.get("_source", {}).get("repo_path")
+     }
+-
+-    data = es_request("GET", es_url, f"{old_index}/_search", payload)
+-
+-    results = {}
+-
+-    for hit in data.get("hits", {}).get("hits", []):
+-        src = hit.get("_source", {})
+-
+-        repo_path = src.get("repo_path") or src.get("repository_path") or src.get("agency_repo")
+-        if not repo_path:
+-            continue
+-
+-        group = src.get("group")
+-        repo = src.get("repo")
+-
+-        if (not group or not repo) and "/" in repo_path:
+-            group, repo = repo_path.split("/", 1)
+-
+-        unit_count = src.get("current_unit_process_count")
+-        if unit_count is None:
+-            unit_count = src.get("unit_process_count", 0)
+-
+-        results[repo_path] = {
+-            "repo_path": repo_path,
+-            "group": group,
+-            "repo": repo,
+-            "current_unit_process_count": int(unit_count or 0)
+-        }
+-
+-    return results
+ 
+ 
+ def get_total_process_count_from_browse(repo_path: str) -> Dict[str, Any]:
+     if "/" not in repo_path:
+-        return {
+-            "current_total_process_count": 0,
+-            "commit_id": None,
+-            "status": "bad_repo_path",
+-            "note": "Could not split repo_path into group/repo."
+-        }
+-
++        return {"current_total_process_count": 0, "commit_id": None,
++                "status": "bad_repo_path", "note": "Invalid repo_path."}
+     group, repo = repo_path.split("/", 1)
+-    url = f"{LCACS_BROWSE_BASE}/{group}/{repo}"
+-
+     try:
+-        resp = requests.get(url, timeout=120)
++        resp = requests.get(f"{LCACS_BROWSE_BASE}/{group}/{repo}", timeout=120)
+         resp.raise_for_status()
+-        data = resp.json()
+-
+-        for entry in data.get("data", []):
++        for entry in resp.json().get("data", []):
+             if entry.get("type") == "PROCESS" and entry.get("typeOfEntry") == "MODEL_TYPE":
+-                return {
+-                    "current_total_process_count": int(entry.get("count", 0) or 0),
+-                    "commit_id": entry.get("commitId"),
+-                    "status": "available",
+-                    "note": "Total PROCESS count pulled from repo-scoped public browse endpoint."
+-                }
+-
+-        return {
+-            "current_total_process_count": 0,
+-            "commit_id": None,
+-            "status": "missing_process_entry",
+-            "note": "Browse endpoint response did not contain a PROCESS model-type entry."
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "current_total_process_count": 0,
+-            "commit_id": None,
+-            "status": "api_error",
+-            "note": f"Browse endpoint lookup failed: {e}"
+-        }
+-
+-
+-# ============================================================================
+-# KPI Construction
+-# ============================================================================
+-
+-def build_docs(
+-    download_counts: Dict[str, int],
+-    old_unit_counts: Dict[str, Dict[str, Any]],
+-    download_index: str,
+-    old_unit_index: str,
+-    start_date: str = None,
+-    end_date: str = None,
+-    run_label: str = "manual",
+-):
+-
+-    docs = []
+-    warnings = []
+-    now = datetime.now(timezone.utc).isoformat()
+-    period_timestamp = f"{end_date}T00:00:00.000Z" if end_date else now
+-
+-    for repo_path, downloads in sorted(download_counts.items(), key=lambda x: x[1], reverse=True):
+-        if "/" in repo_path:
+-            group, repo = repo_path.split("/", 1)
+-        else:
+-            group, repo = None, repo_path
+-
+-        old = old_unit_counts.get(repo_path)
+-        unit_count = int(old.get("current_unit_process_count", 0)) if old else 0
+-
++                return {"current_total_process_count": int(entry.get("count", 0) or 0),
++                        "commit_id": entry.get("commitId"), "status": "available",
++                        "note": "PROCESS total from public browse endpoint."}
++        return {"current_total_process_count": 0, "commit_id": None,
++                "status": "missing_process_entry", "note": "No PROCESS entry in browse response."}
++    except Exception as exc:
++        return {"current_total_process_count": 0, "commit_id": None,
++                "status": "api_error", "note": f"Browse lookup failed: {exc}"}
++
++
++def build_enrichment(repo_path: str, inventory: Dict[str, Dict[str, Any]],
++                     inventory_index: str) -> Tuple[Dict[str, Any], Optional[str]]:
++    inv = inventory.get(repo_path, {})
++    unit_count = int(inv.get("current_unit_process_count", 0) or 0)
++    lci_count = int(inv.get("current_lci_result_count", 0) or 0)
++    total_count = int(inv.get("current_total_process_count", 0) or 0)
++    commit_id = inv.get("commit_id")
++    status = inv.get("process_count_status")
++    note = inv.get("process_count_note")
++
++    if total_count <= 0:
+         browse = get_total_process_count_from_browse(repo_path)
+-        total_count = int(browse["current_total_process_count"] or 0)
+-
+-        if total_count > 0:
+-            if unit_count > 0:
+-                if total_count >= unit_count:
+-                    lci_count = max(total_count - unit_count, 0)
+-                    status = "available"
+-                    note = (
+-                        "Total PROCESS count pulled from repo-scoped browse endpoint. "
+-                        "UNIT_PROCESS count pulled from validated unit-count index. "
+-                        "LCI_RESULT/System Process count derived as PROCESS total minus UNIT_PROCESS."
+-                    )
+-                else:
+-                    total_count = unit_count
+-                    lci_count = 0
+-                    status = "fallback_validated_unit_count_browse_conflict"
+-                    note = (
+-                        "Browse PROCESS total was lower than validated UNIT_PROCESS count. "
+-                        "Using validated UNIT_PROCESS count as total. "
+-                        "LCI_RESULT/System Process count set to 0 because the browse total "
+-                        "could not safely be reconciled."
+-                    )
+-            else:
+-                unit_count = total_count
+-                lci_count = 0
+-                status = "inferred_unit_process_count_from_public_process_total"
+-                note = (
+-                    "Total PROCESS count pulled from repo-scoped browse endpoint, but no validated "
+-                    "UNIT_PROCESS/LCI_RESULT split was available. For the unit-process KPI, the public "
+-                    "PROCESS total is counted as UNIT_PROCESS unless a System Process split is later validated."
+-                )
++        total_count = int(browse.get("current_total_process_count", 0) or 0)
++        commit_id = commit_id or browse.get("commit_id")
++        if total_count > 0 and unit_count > 0 and total_count >= unit_count:
++            lci_count = total_count - unit_count
++            status = "available"
++            note = "PROCESS total from browse; UNIT_PROCESS from inventory; LCI_RESULT derived."
++        elif total_count > 0 and unit_count <= 0:
++            unit_count = total_count
++            lci_count = 0
++            status = "inferred_unit_process_count_from_public_process_total"
++            note = "No validated split; PROCESS total treated as UNIT_PROCESS."
+         else:
+             total_count = unit_count
+             lci_count = 0
+             status = "fallback_unit_only"
+-            note = (
+-                f"{browse['note']} Falling back to validated UNIT_PROCESS count only; "
+-                "LCI_RESULT/System Process count unavailable."
+-            )
+-
+-        doc = {
+-            "@timestamp": period_timestamp,
+-
+-            "repo_path": repo_path,
+-            "group": group,
+-            "repo": repo,
+-            "commit_id": browse.get("commit_id"),
+-
+-            "completed_public_repo_downloads": int(downloads),
+-
+-            "current_unit_process_count": int(unit_count),
+-            "current_lci_result_count": int(lci_count),
+-            "current_total_process_count": int(total_count),
+-
+-            "estimated_unit_process_downloads": int(downloads) * int(unit_count),
+-            "estimated_lci_result_downloads": int(downloads) * int(lci_count),
+-            "estimated_total_process_downloads": int(downloads) * int(total_count),
+-
+-            "unit_process_count_source": old_unit_index if old else "missing_validated_unit_count",
+-            "total_process_count_source": "lcacs_public_browse_endpoint" if browse["status"] == "available" else "fallback_or_missing",
+-            "lci_result_count_source": "derived_total_minus_unit" if status == "available" else "unavailable_or_not_derived",
+-
+-            "process_count_status": status,
+-            "process_count_note": note,
++            note = f"{browse.get('note', '')} Falling back to UNIT_PROCESS count."
++
++    enrichment = {
++        "commit_id": commit_id,
++        "current_unit_process_count": unit_count,
++        "current_lci_result_count": lci_count,
++        "current_total_process_count": total_count,
++        "unit_process_count_source": inv.get("unit_process_count_source", inventory_index if inv else "missing"),
++        "total_process_count_source": inv.get("total_process_count_source", "inventory_or_browse"),
++        "lci_result_count_source": inv.get("lci_result_count_source", "inventory_or_derived"),
++        "process_count_status": status or "unknown",
++        "process_count_note": note or "",
++    }
++    warning = None if enrichment["process_count_status"] == "available" else f"{repo_path}: {enrichment['process_count_status']}"
++    return enrichment, warning
++
++
++def iter_download_events(es_url: str, download_index: str, start_date: Optional[str],
++                         end_date: Optional[str], page_size: int = 5000) -> Iterator[dict]:
++    filters = [
++        {"term": {"download_event_type": "download_prepare"}},
++        {"range": {"status": {"gte": 200, "lt": 300}}},
++    ]
++    if start_date or end_date:
++        bounds: Dict[str, str] = {}
++        if start_date:
++            bounds["gte"] = f"{start_date}T00:00:00Z"
++        if end_date:
++            bounds["lt"] = f"{end_date}T00:00:00Z"
++        filters.append({"range": {"@timestamp": bounds}})
+ 
++    payload = {
++        "size": page_size,
++        "_source": SOURCE_FIELDS,
++        "query": {"bool": {"filter": filters}},
++        "sort": ["_doc"],
++    }
++    data = es_request("POST", es_url, f"{download_index}/_search?scroll=2m", payload)
++    scroll_id = data.get("_scroll_id")
++    try:
++        while True:
++            hits = data.get("hits", {}).get("hits", [])
++            if not hits:
++                break
++            yield from hits
++            data = es_request("POST", es_url, "_search/scroll", {"scroll": "2m", "scroll_id": scroll_id})
++            scroll_id = data.get("_scroll_id", scroll_id)
++    finally:
++        if scroll_id:
++            try:
++                es_request("DELETE", es_url, "_search/scroll", {"scroll_id": [scroll_id]})
++            except Exception:
++                pass
++
++
++def bulk_index(es_url: str, target_index: str, actions: list) -> None:
++    if not actions:
++        return
++    payload = "\n".join(json.dumps(item, separators=(",", ":")) for item in actions) + "\n"
++    resp = requests.post(f"{es_url.rstrip('/')}/_bulk", data=payload,
++                         headers={"Content-Type": "application/x-ndjson"}, timeout=180)
++    if not resp.ok:
++        raise RuntimeError(f"Bulk failed: {resp.status_code} {resp.text}")
++    result = resp.json()
++    if result.get("errors"):
++        errors = [x for x in result.get("items", []) if x.get("index", {}).get("error")]
++        raise RuntimeError(f"Bulk contained errors: {json.dumps(errors[:5])}")
++
++
++def run(es_url: str, download_index: str, inventory_index: str, target_index: str,
++        start_date: Optional[str], end_date: Optional[str], run_label: str,
++        dry_run: bool, batch_size: int = 5000) -> None:
++    inventory = get_inventory(es_url, inventory_index)
++    enrichment_cache: Dict[str, Dict[str, Any]] = {}
++    warnings = set()
++    generated_at = datetime.now(timezone.utc).isoformat()
++    actions = []
++    events = 0
++    estimated_total = 0
++
++    for hit in iter_download_events(es_url, download_index, start_date, end_date):
++        src = hit.get("_source", {})
++        repo_path = src.get("repo_path")
++        if not repo_path:
++            continue
++        if repo_path not in enrichment_cache:
++            enrichment, warning = build_enrichment(repo_path, inventory, inventory_index)
++            enrichment_cache[repo_path] = enrichment
++            if warning:
++                warnings.add(warning)
++        enrichment = enrichment_cache[repo_path]
++
++        unit = int(enrichment["current_unit_process_count"])
++        lci = int(enrichment["current_lci_result_count"])
++        total = int(enrichment["current_total_process_count"])
++        doc = dict(src)
++        doc.update(enrichment)
++        doc.update({
++            "source_event_id": hit.get("_id"),
++            "source_event_index": hit.get("_index"),
++            "completed_public_repo_downloads": 1,
++            "estimated_unit_process_downloads": unit,
++            "estimated_lci_result_downloads": lci,
++            "estimated_total_process_downloads": total,
+             "download_count_source": download_index,
+-            "source": "lcacs_kpi_enrichment",
++            "source": "lcacs_kpi_event_enrichment",
+             "kpi_name": "estimated_process_downloads",
+-
+             "script_name": SCRIPT_NAME,
+             "script_version": SCRIPT_VERSION,
+             "run_label": run_label,
+             "kpi_period_start": start_date,
+             "kpi_period_end": end_date,
+-            "generated_at": now,
+-        }
+-
+-        if status != "available":
+-            warnings.append(f"{repo_path}: {status} - {note}")
+-
+-        docs.append(doc)
+-
+-    return docs, warnings
+-
+-
+-# ============================================================================
+-# Output
+-# ============================================================================
+-
+-def bulk_index(es_url: str, index: str, docs: list):
+-    if not docs:
+-        print("No docs to index.")
+-        return
+-
+-    lines = []
+-
+-    for doc in docs:
+-        doc_id = hashlib.sha1(doc["repo_path"].encode("utf-8")).hexdigest()
+-        lines.append({"index": {"_index": index, "_id": doc_id}})
+-        lines.append(doc)
+-
+-    payload = "\n".join(json.dumps(x) for x in lines) + "\n"
+-
+-    resp = requests.post(
+-        f"{es_url}/_bulk",
+-        headers={"Content-Type": "application/x-ndjson"},
+-        data=payload,
+-        timeout=120
+-    )
+-
+-    if not resp.ok:
+-        raise RuntimeError(f"Bulk failed: {resp.status_code} {resp.text}")
+-
+-    result = resp.json()
+-    if result.get("errors"):
+-        raise RuntimeError(f"Bulk had errors: {json.dumps(result)[:3000]}")
+-
+-
+-def print_summary(
+-    docs: list,
+-    warnings: list,
+-    start_date: str = None,
+-    end_date: str = None,
+-    run_label: str = "manual",
+-    dry_run: bool = False,
+-):
+-    total_downloads = sum(d["completed_public_repo_downloads"] for d in docs)
+-
+-    total_unit = sum(d["current_unit_process_count"] for d in docs)
+-    total_lci = sum(d["current_lci_result_count"] for d in docs)
+-    total_process = sum(d["current_total_process_count"] for d in docs)
+-
+-    est_unit = sum(d["estimated_unit_process_downloads"] for d in docs)
+-    est_lci = sum(d["estimated_lci_result_downloads"] for d in docs)
+-    est_total = sum(d["estimated_total_process_downloads"] for d in docs)
+-
+-    available = sum(1 for d in docs if d["process_count_status"] == "available")
+-    not_available = len(docs) - available
+-
+-    print("\n=== ESTIMATED PROCESS DOWNLOADS SUMMARY ===")
+-    print(f"Script: {SCRIPT_NAME} {SCRIPT_VERSION}")
+-    print(f"Run label: {run_label}")
+-    print(f"KPI period: {start_date} to {end_date}")
++            "generated_at": generated_at,
++        })
++        raw_id = f"{hit.get('_index')}|{hit.get('_id')}|{SCRIPT_VERSION}"
++        doc_id = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()
++        actions.extend([{"index": {"_index": target_index, "_id": doc_id}}, doc])
++        events += 1
++        estimated_total += total
++
++        if len(actions) >= batch_size * 2:
++            if not dry_run:
++                bulk_index(es_url, target_index, actions)
++            actions.clear()
++
++    if actions and not dry_run:
++        bulk_index(es_url, target_index, actions)
++
++    print("\n=== ESTIMATED PROCESS DOWNLOADS EVENT-LEVEL SUMMARY ===")
++    print(f"Source events indexed: {events:,}")
++    print(f"Repositories enriched: {len(enrichment_cache):,}")
++    print(f"Estimated total process downloads: {estimated_total:,}")
++    print(f"KPI period: {start_date} to {end_date} (end exclusive)")
+     print(f"Dry run: {dry_run}")
+-    print(f"Repositories indexed: {len(docs):,}")
+-    print(f"Repositories with full derived process counts: {available:,}")
+-    print(f"Repositories needing review/fallback: {not_available:,}")
+-
+-    print(f"Completed public repo downloads: {total_downloads:,}")
+-
+-    print(f"Current UNIT_PROCESS count across downloaded repos: {total_unit:,}")
+-    print(f"Current LCI_RESULT/System Process count across downloaded repos: {total_lci:,}")
+-    print(f"Current total PROCESS count across downloaded repos: {total_process:,}")
+-
+-    print(f"Estimated UNIT_PROCESS downloads: {est_unit:,}")
+-    print(f"Estimated LCI_RESULT/System Process downloads: {est_lci:,}")
+-    print(f"Estimated total PROCESS downloads: {est_total:,}")
+-
+-    print("\nTop 20 repos by estimated total PROCESS downloads:")
+-    for d in sorted(docs, key=lambda x: x["estimated_total_process_downloads"], reverse=True)[:20]:
+-        print(
+-            f"  {d['estimated_total_process_downloads']:,}\t"
+-            f"{d['repo_path']}\t"
+-            f"downloads={d['completed_public_repo_downloads']:,}\t"
+-            f"unit={d['current_unit_process_count']:,}\t"
+-            f"lci={d['current_lci_result_count']:,}\t"
+-            f"total={d['current_total_process_count']:,}\t"
+-            f"status={d['process_count_status']}"
+-        )
+-
+     if warnings:
+-        print("\nWARNINGS:")
+-        for warning in warnings:
++        print("Warnings:")
++        for warning in sorted(warnings):
+             print(f"  {warning}")
+ 
+ 
+-# ============================================================================
+-# Entry Point
+-# ============================================================================
+-
+-def main():
+-    parser = argparse.ArgumentParser(
+-        description="Create estimated process-download KPI index using public downloads and repo-scoped browse PROCESS totals."
+-    )
+-
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Build event-level estimated process-download KPI index.")
+     parser.add_argument("--es-url", default=DEFAULT_ES_URL)
+     parser.add_argument("--download-index", default=DEFAULT_DOWNLOAD_INDEX)
+-    parser.add_argument("--old-unit-index", default=DEFAULT_OLD_UNIT_INDEX)
+-
+-    parser.add_argument(
+-        "--target-index",
+-        "--index",
+-        dest="target_index",
+-        default=DEFAULT_TARGET_INDEX,
+-    )
+-
++    parser.add_argument("--inventory-index", "--old-unit-index", dest="inventory_index", default=DEFAULT_INVENTORY_INDEX)
++    parser.add_argument("--target-index", "--index", dest="target_index", default=DEFAULT_TARGET_INDEX)
+     parser.add_argument("--start-date", help="Inclusive start date, YYYY-MM-DD")
+     parser.add_argument("--end-date", help="Exclusive end date, YYYY-MM-DD")
+     parser.add_argument("--run-label", default="manual")
++    parser.add_argument("--batch-size", type=int, default=5000)
+     parser.add_argument("--recreate", action="store_true")
+     parser.add_argument("--dry-run", action="store_true")
+-
+     args = parser.parse_args()
+ 
+     create_target_index(args.es_url, args.target_index, recreate=args.recreate)
+-
+-    print(f"Reading download counts from: {args.download_index}")
+-    download_counts = get_public_repo_download_counts(args.es_url, args.download_index)
+-    print(f"Found public repo download counts for {len(download_counts):,} repos.")
+-
+-    print(f"Reading validated UNIT_PROCESS counts from: {args.old_unit_index}")
+-    old_unit_counts = get_old_validated_unit_counts(args.es_url, args.old_unit_index)
+-    print(f"Found validated UNIT_PROCESS counts for {len(old_unit_counts):,} repos.")
+-
+-    docs, warnings = build_docs(
+-        download_counts=download_counts,
+-        old_unit_counts=old_unit_counts,
+-        download_index=args.download_index,
+-        old_unit_index=args.old_unit_index,
+-        start_date=args.start_date,
+-        end_date=args.end_date,
+-        run_label=args.run_label,
+-    )
+-
+-    if not args.dry_run:
+-        bulk_index(args.es_url, args.target_index, docs)
+-    else:
+-        print("Dry run enabled; skipping bulk index.")
+-
+-    print_summary(
+-        docs,
+-        warnings,
+-        start_date=args.start_date,
+-        end_date=args.end_date,
+-        run_label=args.run_label,
+-        dry_run=args.dry_run,
+-    )
++    run(args.es_url, args.download_index, args.inventory_index, args.target_index,
++        args.start_date, args.end_date, args.run_label, args.dry_run, args.batch_size)
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/run_kpi_framework.py b/run_kpi_framework.py
+index 9fdd0be..f1dcd14 100644
+--- a/run_kpi_framework.py
++++ b/run_kpi_framework.py
+@@ -128,18 +128,20 @@ def main():
+     print(f"ES URL:     {args.es_url}")
+     print(f"Dry run:    {args.dry_run}")
+ 
++    index_names = {
++        kpi["name"]: build_index_name(
++            args.index_prefix, kpi["index_suffix"], run_label, args.index_version
++        )
++        for kpi in KPI_SCRIPTS
++    }
++
+     for kpi in KPI_SCRIPTS:
+         script_path = repo_root / kpi["script"]
+ 
+         if not script_path.exists():
+             raise SystemExit(f"Missing KPI script: {script_path}")
+ 
+-        index_name = build_index_name(
+-            args.index_prefix,
+-            kpi["index_suffix"],
+-            run_label,
+-            args.index_version,
+-        )
++        index_name = index_names[kpi["name"]]
+ 
+         cmd = [
+             sys.executable,
+@@ -159,6 +161,12 @@ def main():
+             "--run-label", run_label,
+         ])
+ 
++        if kpi["name"] == "estimated_process_downloads":
++            cmd.extend([
++                "--download-index", index_names["public_repo_downloads"],
++                "--inventory-index", index_names["public_process_inventory"],
++            ])
++
+         if kpi["name"] == "release_activity":
+             events_index_name = build_index_name(
+                 args.index_prefix,

@@ -26,3 +26,9 @@ Historical script versions are preserved under `archive/`.
 ## Goal
 
 Build a parameterized KPI indexing framework that can generate indexes for arbitrary date ranges, such as 30-day, annual, or custom reporting periods, from a single execution entry point.
+
+## Event-level time filtering
+
+The estimated process-download KPI was upgraded in script version 2.0.0 to
+preserve each qualifying download event and its original timestamp. See
+`EVENT_LEVEL_KPI_MIGRATION.md` for build, validation, and Kibana migration steps.
