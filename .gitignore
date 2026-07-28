@@ -36,3 +36,6 @@ kpi_index_exports/
 *.log
 *.log.gz
 access_2024-09-30_to_2025-10-01.log.gz
+
+# Generated Apache log partitions
+lca_log_data/
