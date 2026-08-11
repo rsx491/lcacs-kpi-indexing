@@ -22,6 +22,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -92,7 +93,12 @@ def classify_endpoint(endpoint: str):
     if endpoint.startswith("/lca-collaboration/ws/public/browse/"):
         return "browse"
 
-    if endpoint.startswith("/lca-collaboration/ws/public/download/json/prepare/"):
+    if (
+        endpoint == "/lca-collaboration/ws/public/download/json/prepare"
+        or endpoint.startswith(
+            "/lca-collaboration/ws/public/download/json/prepare/"
+        )
+    ):
         return "download_prepare"
 
     if endpoint.startswith("/lca-collaboration/ws/public/download/json/"):
@@ -101,11 +107,20 @@ def classify_endpoint(endpoint: str):
     if endpoint.startswith("/lca-collaboration/ws/public/repository/file/"):
         return "repository_file"
 
+    if (
+        endpoint == "/lca-collaboration/ws/public/search"
+        or endpoint.startswith(
+            "/lca-collaboration/ws/public/search/usage/"
+        )
+    ):
+        return "search_usage"
+
     return None
 
 def is_documented_api_endpoint_group(group: str) -> bool:
     return group in {
         "search",
+        "search_usage",
         "browse",
         "download_prepare",
         "download_json",
@@ -122,6 +137,8 @@ def create_index(es_url: str, index: str, recreate: bool = False):
         "mappings": {
             "properties": {
                 "@timestamp": {"type": "date"},
+                "source_file": {"type": "keyword"},
+                "source_line": {"type": "long"},
 
                 "host": {"type": "keyword"},
                 "client_ip": {"type": "ip"},
@@ -208,6 +225,7 @@ def bulk_index(es_url: str, index: str, docs: list):
 
     for doc in docs:
         raw_id = (
+            f"{doc['source_file']}|{doc['source_line']}|"
             f"{doc['@timestamp']}|{doc['client_ip']}|{doc['method']}|"
             f"{doc['request_redacted']}|{doc['status']}|{doc['request_time']}"
         )
@@ -264,6 +282,24 @@ def parse_log_file(
     batch = []
     generated_at = datetime.now(timezone.utc).isoformat()
 
+    eastern = ZoneInfo("America/New_York")
+
+    start_boundary = (
+        datetime.strptime(start_date, "%Y-%m-%d")
+        .replace(tzinfo=eastern)
+        .astimezone(timezone.utc)
+        if start_date
+        else None
+    )
+
+    end_boundary = (
+        datetime.strptime(end_date, "%Y-%m-%d")
+        .replace(tzinfo=eastern)
+        .astimezone(timezone.utc)
+        if end_date
+        else None
+    )
+
     with open_log(log_file) as f:
         for line in f:
             total_lines += 1
@@ -283,6 +319,17 @@ def parse_log_file(
             if endpoint_group is None:
                 continue
             is_documented = is_documented_api_endpoint_group(endpoint_group)
+
+            event_time = datetime.strptime(
+                row["timestamp"],
+                TS_FORMAT,
+            ).astimezone(timezone.utc)
+
+            if start_boundary and event_time < start_boundary:
+                continue
+
+            if end_boundary and event_time >= end_boundary:
+                continue
 
             parsed = urlparse(request)
             qs = parse_qs(parsed.query)
@@ -321,6 +368,8 @@ def parse_log_file(
 
             doc = {
                 "@timestamp": parse_timestamp(row["timestamp"]),
+                "source_file": log_file.name,
+                "source_line": total_lines,
 
                 "host": row["host"],
                 "client_ip": row["client_ip"],

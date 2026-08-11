@@ -124,13 +124,16 @@ LOGGER = logging.getLogger("completed-downloads")
 DEFAULT_DEDUPE_SECONDS = 60
 DEFAULT_REQUEST_TIMEOUT = 60
 
+
 PREPARE = "prepare"
 TOKEN_RETRIEVAL = "token_retrieval"
+REPOSITORY_EXPORT = "repository_export"
 BROWSE_DATASET = "browse_dataset"
 REPOSITORY_FILE = "repository_file"
 
 SUPPORTED_DOWNLOAD_TYPES = {
     TOKEN_RETRIEVAL,
+    REPOSITORY_EXPORT,
     BROWSE_DATASET,
     REPOSITORY_FILE,
 }
@@ -178,6 +181,25 @@ BROWSE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+PUBLIC_BROWSE_DATASET_PATTERN = re.compile(
+    r"^/lca-collaboration/ws/public/browse/"
+    r"(?P<group>[^/]+)/"
+    r"(?P<repo>[^/]+)/"
+    r"(?P<resource_type>[^/]+)/"
+    r"(?P<resource_id>[^/]+)$",
+re.IGNORECASE,
+)
+
+PUBLIC_REPOSITORY_FILE_PATTERN = re.compile(
+    r"^/lca-collaboration/ws/public/repository/file/"
+    r"(?P<group>[^/]+)/"
+    r"(?P<repo>[^/]+)/"
+    r"(?P<resource_type>[^/]+)/"
+    r"(?P<resource_id>[^/]+)/"
+    r"(?P<file_path>.+)$",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ParsedEvent:
@@ -188,6 +210,7 @@ class ParsedEvent:
     query: dict[str, list[str]]
     status: int
     client_ip: str
+    event_type: str | None = None
 
     user_id: str | None = None
     api_key: str | None = None
@@ -608,6 +631,7 @@ def extract_repository(
     path: str,
 ) -> str | None:
     explicit = first_nonempty(
+        data.get("repository_key"),
         data.get("repository"),
         data.get("repository_id"),
         data.get("repo"),
@@ -622,6 +646,17 @@ def extract_repository(
 
     if explicit:
         return explicit
+
+    for route_pattern in (
+        PUBLIC_BROWSE_DATASET_PATTERN,
+        PUBLIC_REPOSITORY_FILE_PATTERN,
+    ):
+        match = route_pattern.fullmatch(path)
+
+        if match:
+            group = urllib.parse.unquote(match.group("group"))
+            repo = urllib.parse.unquote(match.group("repo"))
+            return f"{group}/{repo}"
 
     patterns = (
         r"/repositories/(?P<value>[^/?#]+)",
@@ -659,6 +694,17 @@ def extract_resource_type(
 
     if explicit:
         return explicit
+
+    for route_pattern in (
+        PUBLIC_BROWSE_DATASET_PATTERN,
+        PUBLIC_REPOSITORY_FILE_PATTERN,
+    ):
+        match = route_pattern.fullmatch(path)
+
+        if match:
+            return urllib.parse.unquote(
+                match.group("resource_type")
+            ).upper()
 
     lowered_path = path.lower()
 
@@ -724,6 +770,17 @@ def extract_resource_id(
     if explicit:
         return explicit
 
+    for route_pattern in (
+        PUBLIC_BROWSE_DATASET_PATTERN,
+        PUBLIC_REPOSITORY_FILE_PATTERN,
+    ):
+        match = route_pattern.fullmatch(path)
+
+        if match:
+            return urllib.parse.unquote(
+                match.group("resource_id")
+            )
+
     if event_type == REPOSITORY_FILE:
         match = re.search(
             r"/repository/file/(.+)$",
@@ -732,7 +789,9 @@ def extract_resource_id(
         )
 
         if match:
-            return urllib.parse.unquote(match.group(1)).strip("/")
+            return urllib.parse.unquote(
+                match.group(1)
+            ).strip("/")
 
     if event_type == BROWSE_DATASET:
         segments = [
@@ -776,16 +835,14 @@ def classify_event(path: str) -> str | None:
 
 def qualifies_as_single_dataset_download(event: ParsedEvent) -> bool:
     """
-    Restrict /browse/... counting to requests that identify a specific dataset.
+    Count only exact individual-dataset browse requests:
 
-    This prevents a general repository/category browse request from being
-    counted as a completed dataset download.
+    /lca-collaboration/ws/public/browse/
+    {group}/{repo}/{type}/{refId}
     """
     return bool(
-        event.repository
-        and event.resource_type
-        and event.resource_id
-    )
+        PUBLIC_BROWSE_DATASET_PATTERN.fullmatch(event.path)
+)
 
 
 def event_from_json(
@@ -805,7 +862,10 @@ def event_from_json(
     ) or "/"
 
     path, query = parse_request_url(request)
-    event_type = classify_event(path)
+    event_type = first_nonempty(
+    data.get("event_type"),
+    classify_event(path),
+)
 
     timestamp = parse_iso_datetime(
         first_nonempty(
@@ -892,6 +952,7 @@ def event_from_json(
             )
         ),
         client_ip=client_ip,
+        event_type=event_type,
         user_id=user_id,
         api_key=api_key,
         session_id=session_id,
@@ -1334,6 +1395,11 @@ def deduplicate_downloads(
     *,
     window_seconds: int,
 ) -> tuple[list[CompletedDownload], int]:
+    candidates_list = list(candidates)
+
+    if window_seconds <= 0:
+        return candidates_list, 0
+
     window = timedelta(seconds=window_seconds)
 
     completed: list[CompletedDownload] = []
@@ -1345,7 +1411,7 @@ def deduplicate_downloads(
     duplicate_count = 0
 
     for candidate in sorted(
-        candidates,
+        candidates_list,
         key=lambda item: item.timestamp,
     ):
         key = dedupe_key(candidate)
@@ -1394,7 +1460,7 @@ def process_events(
             metrics.outside_date_range += 1
             continue
 
-        event_type = classify_event(event.path)
+        event_type = event.event_type or classify_event(event.path)
 
         if event_type is None:
             metrics.irrelevant_events += 1
@@ -1413,6 +1479,28 @@ def process_events(
                 prepare_by_token[event.prepare_token] = event
                 prepare_tokens_seen.add(event.prepare_token)
 
+            continue
+
+        if event_type == REPOSITORY_EXPORT:
+            metrics.token_retrieval_requests += 1
+
+            if event.status != 200:
+                metrics.failed_retrievals += 1
+                continue
+
+            candidate = build_download_from_repository_export(
+                event,
+                preserve_raw_clients=preserve_raw_clients,
+                client_hash_salt=client_hash_salt,
+            )
+
+            if candidate is None:
+                metrics.missing_resource_identity += 1
+                continue
+
+            metrics.successful_token_retrievals += 1
+            metrics.matched_token_retrievals += 1
+            candidates.append(candidate)
             continue
 
         if event_type == TOKEN_RETRIEVAL:
@@ -1498,6 +1586,22 @@ def process_events(
         window_seconds=dedupe_window_seconds,
     )
 
+    public_repo_keys_path = Path("public_repo_keys.txt")
+
+    public_repository_keys = {
+        line.strip()
+        for line in public_repo_keys_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    }
+
+    downloads = [
+        download
+        for download in downloads
+        if download.repository in public_repository_keys
+    ]
+
     metrics.duplicate_retries = duplicate_count
     metrics.abandoned_prepares = len(
         prepare_tokens_seen - matched_prepare_tokens
@@ -1524,8 +1628,46 @@ def process_events(
     return ProcessingResult(
         downloads=downloads,
         metrics=metrics,
-    )
+)
 
+def build_download_from_repository_export(
+        event: ParsedEvent,
+        *,
+        preserve_raw_clients: bool,
+        client_hash_salt: str,
+    ) -> CompletedDownload | None:
+        """
+        Build a completed-download document from an already-normalized
+        repository_export JSONL event.
+        """
+        if not event.repository:
+            return None
+
+        client = resolve_client(event)
+
+        return CompletedDownload(
+            timestamp=event.timestamp,
+            event_type="completed_download",
+            download_type=REPOSITORY_EXPORT,
+            repository=event.repository,
+            resource_type=event.resource_type or "repository",
+            resource_id=(
+                event.resource_id
+                or event.token
+                or event.repository
+            ),
+            client_identifier_type=client.identity_type,
+            client_identifier=protected_client_value(
+                client,
+                preserve_raw=preserve_raw_clients,
+                salt=client_hash_salt,
+            ),
+            retrieval_path=event.path,
+            retrieval_status=event.status,
+            token=event.token,
+            source_file=event.source_file,
+            source_line=event.source_line,
+        )
 
 def download_to_document(
     download: CompletedDownload,
@@ -1813,9 +1955,9 @@ def bulk_index(
         total_indexed += len(batch)
 
         LOGGER.info(
-            "Indexed %,d of %,d documents",
-            total_indexed,
-            len(downloads),
+            "Indexed %s of %s documents",
+            f"{total_indexed:,}",
+            f"{len(downloads):,}",
         )
 
 

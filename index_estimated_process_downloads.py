@@ -21,6 +21,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -31,10 +32,18 @@ DEFAULT_TARGET_INDEX = "lcacs-kpi-estimated-process-downloads"
 LCACS_BROWSE_BASE = "https://www.lcacommons.gov/lca-collaboration/ws/public/browse"
 
 SOURCE_FIELDS = [
-    "@timestamp", "host", "client_ip", "method", "request", "endpoint",
-    "status", "bytes", "referrer", "user_agent", "upstream", "request_time",
-    "download_event_type", "group", "repo", "repo_path", "commit_id",
-    "is_public_repo", "is_repo_identifiable",
+    "@timestamp",
+    "client_ip",
+    "method",
+    "request",
+    "retrieval_status",
+    "download_type",
+    "repository",
+    "resource_type",
+    "resource_id",
+    "business_definition_version",
+    "source_file",
+    "source_line",
 ]
 
 
@@ -196,17 +205,39 @@ def build_enrichment(repo_path: str, inventory: Dict[str, Dict[str, Any]],
 def iter_download_events(es_url: str, download_index: str, start_date: Optional[str],
                          end_date: Optional[str], page_size: int = 5000) -> Iterator[dict]:
     filters = [
-        {"term": {"download_event_type": "download_prepare"}},
-        {"range": {"status": {"gte": 200, "lt": 300}}},
+        {
+            "terms": {
+                "download_type": [
+                    "browse_dataset",
+                    "repository_export",
+                    "repository_file",
+                ]
+            }
+        },
+        {"term": {"retrieval_status": 200}},
     ]
+
     if start_date or end_date:
         bounds: Dict[str, str] = {}
-        if start_date:
-            bounds["gte"] = f"{start_date}T00:00:00Z"
-        if end_date:
-            bounds["lt"] = f"{end_date}T00:00:00Z"
-        filters.append({"range": {"@timestamp": bounds}})
+        eastern = ZoneInfo("America/New_York")
 
+        if start_date:
+            local_start = datetime.fromisoformat(start_date).replace(
+                tzinfo=eastern
+            )
+            bounds["gte"] = local_start.astimezone(
+                timezone.utc
+            ).isoformat()
+
+        if end_date:
+            local_end = datetime.fromisoformat(end_date).replace(
+                tzinfo=eastern
+            )
+            bounds["lt"] = local_end.astimezone(
+                timezone.utc
+            ).isoformat()
+
+    filters.append({"range": {"@timestamp": bounds}})
     payload = {
         "size": page_size,
         "_source": SOURCE_FIELDS,
@@ -258,7 +289,7 @@ def run(es_url: str, download_index: str, inventory_index: str, target_index: st
 
     for hit in iter_download_events(es_url, download_index, start_date, end_date):
         src = hit.get("_source", {})
-        repo_path = src.get("repo_path")
+        repo_path = src.get("repository")
         if not repo_path:
             continue
         if repo_path not in enrichment_cache:
@@ -272,6 +303,7 @@ def run(es_url: str, download_index: str, inventory_index: str, target_index: st
         lci = int(enrichment["current_lci_result_count"])
         total = int(enrichment["current_total_process_count"])
         doc = dict(src)
+        doc["repo_path"] = repo_path
         doc.update(enrichment)
         doc.update({
             "source_event_id": hit.get("_id"),
