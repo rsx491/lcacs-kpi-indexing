@@ -5,6 +5,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime
+from elasticsearch import Elasticsearch
+from qa.post_processing import validate_index
 
 
 DATE_RANGE_RE = re.compile(
@@ -48,6 +51,19 @@ KPI_SCRIPTS = [
         "script": "index_release_activity.py",
         "index_suffix": "release-activity",
         "requires_log_file": True,
+        "qa": {
+            "post_processing": {
+                "output": "events",
+                "timestamp_field": "@timestamp",
+                "required_fields": (
+                    "@timestamp",
+                    "activity_type",
+                    "method",
+                    "status",
+                    "request_path",
+                ),
+            },
+        },
     },
 ]
 
