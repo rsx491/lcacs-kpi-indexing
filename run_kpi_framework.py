@@ -21,12 +21,46 @@ KPI_SCRIPTS = [
         "script": "index_api_calls.py",
         "index_suffix": "api-calls",
         "requires_log_file": True,
+        "qa": {
+            "post_processing": {
+                "timestamp_field": "@timestamp",
+                "required_fields": (
+                    "@timestamp",
+                    "method",
+                    "endpoint",
+                    "api_endpoint_group",
+                    "status",
+                    "is_public_api_call",
+                    "has_api_key",
+                    "api_auth_type",
+                ),
+            },
+        },
     },
     {
         "name": "completed_downloads",
         "script": "index_completed_downloads.py",
         "index_suffix": "public-repository-download-events",
         "requires_log_file": True,
+        "qa": {
+            "post_processing": {
+                "timestamp_field": "@timestamp",
+                "required_fields": (
+                    "@timestamp",
+                    "event_type",
+                    "download_type",
+                    "repository",
+                    "resource_type",
+                    "resource_id",
+                    "client_identifier_type",
+                    "client_identifier",
+                    "retrieval_path",
+                    "retrieval_status",
+                    "business_definition_version",
+                    "dedupe_rule",
+                ),
+            },
+        },
     },
     {
         "name": "public_process_inventory",
@@ -329,6 +363,33 @@ def main():
                 cmd,
                 dry_run=args.dry_run,
             )
+
+            # Post-processing QA
+            qa_config = kpi.get("qa", {}).get("post_processing")
+
+            if qa_config and not args.dry_run:
+                qa_index_name = index_name
+
+            if qa_config.get("output") == "events":
+                qa_index_name = events_index_name
+
+            qa_result = validate_index(
+                es=Elasticsearch(args.es_url),
+                index_name=qa_index_name,
+                start_date=datetime.fromisoformat(start_date),
+                end_date=datetime.fromisoformat(end_date),
+                timestamp_field=qa_config["timestamp_field"],
+                required_fields=qa_config.get("required_fields", ()),
+            )
+
+    print(f"\nQA result for {kpi['name']}:")
+    print(qa_result)
+
+    if not qa_result.passed:
+        raise SystemExit(
+            f"QA FAILED for {kpi['name']}: "
+            + "; ".join(qa_result.errors)
+        )
 
         if args.output_mode in ("consolidated", "both"):
             consolidated_index = (
